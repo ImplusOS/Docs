@@ -1,0 +1,90 @@
+Third Party Licenses
+
+This OS includes third-party software listed below.
+
+stb (Header/stb_image.h, Header/stb_truetype.h)
+
+Copyright (c) Sean Barrett
+
+Licensed under the MIT License.
+See:
+https://github.com/nothings/stb/blob/master/LICENSE
+
+License file:
+Docs/OSS_License/LICENSEFILE/stb_image
+Docs/OSS_License/LICENSEFILE/stb_truetype
+
+Noto Sans Japanese
+
+Copyright 2014 Google Inc.
+Copyright 2014 Adobe Systems Incorporated
+
+Licensed under the SIL Open Font License, Version 1.1
+See:
+https://fonts.google.com/noto/specimen/Noto+Sans+JP/license
+
+License file:
+Docs/OSS_License/LICENSEFILE/Noto_Sans_Japanese
+
+OVMF_CODE_4M
+
+Open Virtual Machine Firmware (OVMF)
+Part of the TianoCore EDK II project
+
+Copyright (c) TianoCore contributors
+
+Licensed under the BSD 2-Clause Patent License.
+See:
+https://github.com/tianocore/edk2/blob/master/License.txt
+
+License file:
+Docs/OSS_License/LICENSEFILE/OVMF_CODE_4M
+
+zlib
+
+Copyright (c) 1995-2026 Jean-loup Gailly and Mark Adler.
+
+Licensed under the zlib License
+See:
+https://www.zlib.net/zlib_license.html
+
+License file:
+Docs/OSS_License/LICENSEFILE/zlib
+
+libpng
+
+Copyright (c) 1995-2026 The PNG Reference Library Authors.
+Copyright (c) 2018-2026 Cosmin Truta.
+Copyright (c) 2000-2002, 2004, 2006-2018 Glenn Randers-Pehrson.
+Copyright (c) 1996-1997 Andreas Dilger.
+Copyright (c) 1995-1996 Guy Eric Schalnat, Group 42, Inc.
+
+Licensed under the libpng License
+See:
+https://www.libpng.org/pub/png/src/libpng-LICENSE.txt
+
+License file:
+Docs/OSS_License/LICENSEFILE/libpng
+
+libjpeg-turbo
+
+Copyright (c) 1991-2026 The libjpeg-turbo Project and many others.
+
+Licensed under three compatible BSD-style licenses.
+See:
+https://github.com/winlibs/libjpeg/blob/master/LICENSE.md
+
+License file:
+Docs/OSS_License/LICENSEFILE/libjpeg
+
+FreeType
+
+Copyright (c) 1996-2002, 2006 by David Turner, Robert Wilhelm, and Werner Lemberg.
+
+Licensed under the FreeType License (FTL) OR GPL-2.0-or-later (dual).
+See:
+https://freetype.org/
+
+License files:
+Docs/OSS_License/LICENSEFILE/freetype
+Docs/OSS_License/LICENSEFILE/GPL-2.0
