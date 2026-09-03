@@ -1604,3 +1604,175 @@ NULL を返す（＝クライアントにエラーが返るだけでクラッシ
 2. M20 と同型の「ゼロで返ってくるはずのない構造体がゼロ」パターンなので、
    残存するメモリ破壊の可能性も一応疑う（brk/mmap は分離済みだが、
    `process_user_alloc` のフリーリスト再利用など未検証の経路はまだある）
+
+---
+
+## M24. WM と共存させる（黒画面の解消）・起動高速化・#PF の真因特定
+
+**このセッションの成果**: (a) X をパネル占有からウィンドウ内描画に切り替えて
+WM と共存できるようにした（＝「黒画面」の解消）、(b) 起動経路から固定待ちと
+過剰なシリアル出力を除いた、(c) `glDeleteShader` での #PF の原因を
+**libGLdispatch の GOT 1 ワードの実行時破壊**まで特定した（修正は未了）。
+
+| ファイル | 変更 |
+|---|---|
+| `Kernel/Core/drm/DRM_Kms.{c,h}` | `drm_kms_set_mirror(pixels, w, h)` / `drm_kms_mirror_take_dirty()`。mirror 登録中は `blit_fb_to_display()` がパネルではなく登録サーフェスへ書き、`display_present()` を呼ばない。宛先は**物理ページ列**で保持する（blit は flip ioctl を出した Xorg のコンテキストで走る一方、バッファはランチャのものなので、アドレス空間を共有していないため）。`fill_mode()` も mirror サイズを唯一のモードとして広告するので、X は最初からウィンドウと同じ解像度で立ち上がる |
+| `Kernel/Core/syscall/` | `SYSCALL_DISPLAY_KMS_MIRROR` (271) / `SYSCALL_DISPLAY_KMS_MIRROR_DIRTY` (272) / `SYSCALL_UNIX_LISTENING` (270) |
+| `Kernel/IPC/UnixSocket.c` | `unix_socket_path_listening()` — 副作用なしの「誰か listen しているか」問い合わせ |
+| `Userland/Application/Doom/Start.c` | 普通の WM ウィンドウ（1024x640）を作り、そのバッキングストアを mirror として登録してから Xorg を spawn。`window_set_surface_opaque()` を立てる（X は α を書かないため、これが無いとウィンドウが素通しに見える）。フレームが来たときだけ `window_damage()` |
+
+WM が居ない場合（初期ブリングアップ、WM 起動失敗）は mirror を登録せず、
+従来どおり X がパネルへ直接スキャンアウトする。
+
+**実測**: デスクトップ（壁紙・タスクバー・時計）の上に装飾付きの
+"Doom (X11)" ウィンドウが出て、X は `Modeline "1024x640"` で起動する。
+
+### (b) 起動高速化
+
+| 直したもの | 効果 |
+|---|---|
+| `XORG_SETTLE_MS` の固定 60 秒 sleep | `unix_socket_is_listening("/tmp/.X11-unix/X0")` のポーリングに置換。X が accept に到達した瞬間に進む（60 秒は毎回まるごと払っていた） |
+| `[lxmap]` / `[hb]`+`[CPUS]` / `[sig]` / `[execve-ok]` / `[exit]` / `[fork]` | `OS_CONFIG_FOREIGN_TRACE`（既定 0）で一括ゲート。COM1 は syscall パスの中から 1 文字ずつ叩くので、X + GL クライアントが起動までに出す ~400 のモジュール mmap と数千の小パケットがそのまま起動時間になっていた |
+| Xorg の `-verbose 3 -logverbose 3` | 削除（既定へ）。X のログは stderr と `-logfile` の**両方**に出るので二重に効く |
+| `LIBGL_DEBUG=verbose` | 削除 |
+| `GALLIUM_DRIVER=softpipe` の重複エントリ | 削除。`getenv()` は最初の一致を返すので `llvmpipe` が勝っており、**一度も効いていなかった**（「softpipe を試して駄目だった」と読めてしまうため紛らわしい） |
+
+シリアル出力量は同じ区間で 172,662 → 67,934 バイト。ランチャは
+`[doom] Xorg ready after N ms` を出すので、以後はこの数字を見ればよい。
+
+### (c) `glDeleteShader` での #PF — 真因は「カーネルが SSE を使っていた」
+
+**修正済み。Doom はタイトル画面〜ゲーム画面の描画まで到達する。**
+
+**症状**（M23 の続き。毎回同じアドレスで再現していた）:
+
+```
+[OS] [PF] CR2:0x0 RIP:0x0 Error:0x15 (present|user|命令フェッチ)
+[OS] [PF] user stack: 0x4000046AEB ...
+```
+
+`0x46AEB` は Doom 本体の `create_shader+0x3c7`、直前は
+`mov 0x3678c(%rip),%rdx  # __glewDeleteShader` / `call *%rdx`。
+
+#### 追い方（遠回りした分も含めて記録する）
+
+フォルト時のレジスタは `rax = -664` / `r11 = 0x457FE55E50`。カーネルに TLS
+ウィンドウダンプを足すと `tp-664` は **Mesa 内部の `struct _glapi_table`**、
+`tp-208` は **glvnd のディスパッチテーブル**だった。glvnd のスタブは
+`_glapi_tls_Current`(= `tp-208`) を読むはずなのに `-664` を使っている、
+つまり GOT が壊れている——と一旦は考えた。**これは誤りだった。**
+
+`LD_PRELOAD` プローブと `[OS] [PF] tpoff` ダンプで否定できた:
+
+```
+[glvndprobe] slot at ctor: -208
+[glvndprobe] slot before glXMakeCurrent: -208
+[glvndprobe] slot after  glXMakeCurrent: -208
+[OS] [PF] tpoff slot=0x4100475F98 ... pre-invlpg=-208 post=-208 phys=0x10B07F98
+```
+
+GOT は最初から最後まで正しい。カーネルのヒューリスティックが**連鎖の1段目
+しか追えていなかった**のが原因で、実際は2段構えだった:
+
+```
+Doom          call *__glewDeleteShader
+  -> glvnd スタブ (libGLdispatch+0x47ee0)
+        mov _glapi_tls_Current@GOTTPOFF(%rip),%rax   ; rax = -208  ← 正しい
+        mov %fs:(%rax),%r11                          ; glvnd のテーブル
+        jmp *0xfb8(%r11)                             ; glvnd index 503
+  -> Mesa の public entry (libgallium+0x83EC40 = base+0x83af80 + 486*32)
+        mov _mesa_glapi_tls_Dispatch@GOTTPOFF(%rip),%rax ; rax = -664 ← これ
+        mov %fs:(%rax),%r11                          ; Mesa のテーブル
+        jmp *0xf30(%r11)                             ; Mesa slot 486
+  -> 0                                               ; ここで RIP=0
+```
+
+`rax`/`r11` は**最後のスタブのもの**で、GOT 破壊ではなかった。
+
+#### 真因
+
+Mesa のディスパッチテーブルを丸ごと走査させると:
+
+```
+[OS] [PF] r11 table nulls: 0x1E5 0x1E6 0x78E total=3/2048
+```
+
+NULL は **485 = `DeleteProgram`** と **486 = `DeleteShader`** の2つだけ
+（0x78E=1934 はテーブル長のさらに外側）。1934 エントリ中、他は全部埋まって
+いる。Mesa の静的 noop テーブルにも NULL は無い（全 1934 が `0x83af00`）。
+
+**隣接する2つのポインタだけがゼロ** — これは、コンパイラが2つの連続した
+`SET_` 代入をまとめて出す **1本の16バイト SSE ストア (`movups %xmm0,disp(%rbx)`)**
+が、ゼロの xmm を書いた形。そして:
+
+```
+$ x86_64-elf-objdump -d Build/x86_64/Kernel/Kernel_Main.ELF | grep -c '%xmm'
+4565
+$ grep -c 'fxsave\|xsave' Kernel/Source/Arch/x86_64/cpu/{IDT,Syscall_Entry}.asm
+0
+```
+
+**カーネルは 4,565 個の xmm 命令を含みながら、syscall / 割り込みのエントリで
+FPU/SSE を一切保存していなかった。** `process_fpu_save()` はスケジューラ層
+（`process_schedule_on_syscall`）にしか無く、そこに着く頃にはカーネルの C
+コードが既に xmm を破壊している。＝**syscall や割り込みが入るたびに、
+中断されたユーザスレッドのベクタレジスタが黙って壊れていた。**
+
+#### 対処
+
+| ファイル | 変更 |
+|---|---|
+| `Kernel/Source/config/arch.mk` | カーネル全体に **`-mgeneral-regs-only`**。コンパイラが FPU/SSE レジスタを一切使わなくなるので、エントリでの保存が不要になる（Linux が `-mno-sse` でやっているのと同じ方針）|
+| `Kernel/Source/Drivers/module.mk` | ドライバモジュールも同じ（カーネル文脈で、中断されたスレッドのレジスタ上で動くため）|
+| `Kernel/Source/Makefile` | 例外は3つだけ: `Debug/panic/Panic.c` / `Debug/printf/printf.c`（stb_truetype による画面テキスト描画）と、それが呼ぶ `libc/I_libc/src/math.c`。前2つはブート時とパニック時にしか動かず、`kernel_main()` は userland へ渡す前に `serial_set_screen_mirror(NULL)` でミラーを外す |
+| `libc/I_libc/Source/src/stdlib.c` | `strtod`/`strtof`/`strtold`/`atof` を `#ifndef KERNEL` で除外（カーネルからの呼び出しは0件）|
+| `libc/I_libc/Source/src/stdio.c` | `printf`/`scanf` の浮動小数点変換を同様に除外 |
+
+検証:
+
+```
+$ for f in $(find Build/x86_64/Kernel -name '*.o'); do ... done
+1242  Debug/printf/printf.o
+1175  Debug/panic/Panic.o
+1172  libc/I_libc/src/math.o      ← 例外の3つだけ。他は0
+$ 19 個のドライバモジュール: xmm 命令 0
+```
+
+ブート結果:
+
+```
+make current
+shader: 3
+vertexArray: 1
+Failed to open joystick!
+Allocating screen buffer, image buffer and palette.
+Finished initializing!
+```
+
+`glDeleteShader` を通過し、シェーダのコンパイル・リンクと VAO 生成に成功、
+Doom が初期化を完走。**ブート全体で `Page fault` 0件**。スクリーンショットでは
+デスクトップ上の "Doom (X11)" ウィンドウにゲーム画面（通路・バレル・
+ステータスバー AMMO/HEALTH/ARMOR）が描画されている。
+
+この不具合は Doom 固有ではない。SSE を使うあらゆる userland
+（Mesa・LLVM・glibc の SSE 版 `memcpy`/`strlen` 等）が、syscall や
+タイマー割り込みのたびにレジスタを壊されていたので、これまでの
+「原因不明の散発的な破壊」の少なくとも一部は同じ根に由来する可能性が高い。
+
+#### 診断時に踏んだ罠
+
+`glibc_envp` にはすでに `LD_PRELOAD=libgbm.so.1` が入っている
+（`modesetting_drv.so` の未定義 `gbm_*` を埋めるのに必須）。glibc の ld.so は
+`LD_PRELOAD` を**最後の1つだけ**採用するので、診断用 preload を別行で足すと
+libgbm の preload が消えて Xorg が
+`undefined symbol: gbm_bo_get_plane_count` → "No drivers available" で落ちる。
+追加するときは既存の行にコロンで連結すること。
+
+**残っている既知の穴（今回は未対応）**:
+
+- `/dev/input/event0` / `event1` は `evdev_push_key_event()` /
+  `evdev_push_rel_event()` を**誰も呼んでいない**ので、X に入力が一切
+  届かない。カーネルの入力は pull 型（`input_manager_read_*`）なので、
+  tee を入れるうえに WM とフォーカスを取り合わないゲートが要る
+- Doom は 320x200 で描画し、ウィンドウ (1024x640) 側でスケールしないので
+  左上に小さく出る
