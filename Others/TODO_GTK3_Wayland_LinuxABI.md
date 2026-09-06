@@ -1,7 +1,9 @@
 # ImplusOS — GTK3 / Wayland 外来 Linux ABI 実行プラン
 
-> **ステータス: 2026-08-29。G1/G2 完了（W1 達成）。G3（Wayland コンポジタ）第1弾
-> 実装 = カーネル共有メモリ配線 K1–K5 ＋ ハンドロール compositor。QEMU 検証待ち。**
+> **ステータス: 2026-09-05。G1〜G5 完了。QEMU 実起動で Debian 無改変の
+> `gtk3-demo` が ImplusOS 上に**ウィンドウを描画し、ポインタ入力にも応答する**。
+> 到達までにカーネル/ランタイム側のバグを 12 件修正した（§4）。
+> 残るは W6（WM を落として panel バックエンドへ昇格する経路）のみ。**
 >
 > 調査基準日: 2026-08-29
 > 目的: 外来の動的リンク GTK3 / Wayland Linux バイナリ（第一目標は Debian trixie の
@@ -54,6 +56,11 @@ $ ld-linux-x86-64.so.2 --library-path <stage>/usr/lib/x86_64-linux-gnu \
 | `Makefile` | 変更（1 行） | `linux_runtime_stage` の `-C` 呼び出しに `gtkdata` を追加 |
 | `Userland/Application/com.ImplusOS.gtk3demo/` | 新規 | `/usr/bin/gtk3-demo` を `process_spawn` するネイティブ・ランチャ（Doom/Chromium と同型） |
 | `Userland/Application/com.ImplusOS.windowmanager/Resource/Apps/apps.list` | 変更 | `GTK3 Demo` を追加（`APP_DIRS` 自動 glob なので Makefile 改修不要） |
+| `Userland/Application/com.ImplusOS.waylandcompositor/{Compositor.h,Wayland.c,Compositor.c}` | 変更/新規（G3） | WM 非依存の Wayland 表示サーバ本体 |
+| `Userland/Application/com.ImplusOS.waylandcompositor/Tests/` | 新規（G3） | ホスト側ハーネス（実 GTK3 バイナリで回帰） |
+| `Kernel/Core/syscall/{Syscall_Main.h,Syscall_Dispatch.c,Syscall_File.c,Syscall_File.h}` | 変更（G3） | `SYSCALL_MEMFD_FROM_SHM`(273)：共有メモリ → memfd（`wl_keyboard.keymap` の fd 送出） |
+| `Userland/{Source/Syscalls.c,API/Source/Memory.h}`, `libc/I_libc/.../sys/syscalls.h` | 変更（G3） | `os_memfd_from_shm()` ラッパ |
+| `Userland/Application/com.ImplusOS.gtk3demo/Start.c` | 変更（G3） | ソケット待ち合わせ、compositor の再利用、クライアント／モードを引数で選択 |
 | `Kernel/Core/process/ProcessManager_Create.c` | 変更 | 外来 Linux ABI の既定 envp（`glibc_envp`）に `HOME` / `XDG_*` / `GDK_BACKEND=wayland,x11` / `GSETTINGS_SCHEMA_DIR` / `GSETTINGS_BACKEND=memory` / `FONTCONFIG_*` を追加。ネイティブ経路は不変、Chromium にも無害（GDK_BACKEND は Ozone が無視） |
 
 ### `stage-gtkdata.sh` が STAGE_DIR に置くもの
@@ -119,51 +126,105 @@ $ ld-linux-x86-64.so.2 --library-path <stage>/usr/lib/x86_64-linux-gnu \
       `Gtk-WARNING: cannot open display:` で正常終了（クラッシュ/ハング無し、
       カーネル巻き込み無し）。**＝ G1/G2 完了、W1 達成**。以降は実描画＝G3。
 
-### G3 — Wayland コンポジタ（最小）  【第1弾実装済み、QEMU 検証待ち — TODO_glibc_Port.md セッション20】
+### G3 — Wayland コンポジタ 【完了 2026-09-04】
 
-**方式 (a) で実装**: libwayland 非依存のハンドロール compositor
-`Userland/Application/com.ImplusOS.waylandcompositor/`（ネイティブ ELF）。
-`/tmp/wayland-0` で listen（ネイティブ AF_UNIX syscall 220–229）、committed
-`wl_shm` バッファを `Window.h` の backing store に blit。
+**目的の変更**: 当初は「WM のウィンドウ 1 枚に GTK の描画をブリッジする」だけ
+だったが、それでは GTK3 が `com.ImplusOS.windowmanager` に依存してしまう。
+compositor を**それ自体で完結した表示サーバ**に作り替え、WM を「2 つある
+出力バックエンドの片方」に格下げした。WM は前提条件ではなくなった。
 
-**カーネル前提として実装した K1–K5**:
-- K1: memfd を `SharedMemory.c` の共有オブジェクトで裏打ち。`linux_mmap` の
-  memfd 経路で実共有ページをマップ（従来はスナップショットコピーで無意味）。
-- K2: `SCM_RIGHTS` を実装（`sendmsg` が memfd→共有ハンドル化＋grant、`recvmsg`
-  が受信側に memfd fd を install）。従来は生 fd 整数コピーで無意味だった。
-- K3: AF_UNIX リング 1 KiB→256 KiB、`recv` の EAGAIN/EOF 区別。
-- K4: `SYSCALL_MEMFD_SHM_HANDLE`(269) ＋ `os_memfd_shm_handle()`。
-- K5: `poll`/`epoll` が AF_UNIX fd（0x8000+）を認識（`unix_socket_poll`）。
-  これが無いと libwayland がディスプレイ fd を死んだ接続と誤認する。
+| バックエンド | 条件 | 出力 | 入力 |
+|---|---|---|---|
+| **panel** | WM 不在（または引数 `panel`） | `window_register_service()` で入力オーナー権を取得 → `sys_get_display_framebuffer()` へ直接スキャンアウト | `input_read_keyboard/mouse`（生 HID、相対デルタ） |
+| **hosted** | WM 稼働中（既定） | WM ウィンドウ 1 枚の backing store に合成 | `window_input_*_poll`（WM のルーティング、ウィンドウ座標） |
 
-**未了**: 実 QEMU 起動での動作確認、resize（プール再作成）、gdk-pixbuf、
-入力（U3）、複数クライアント、`wl_keyboard.keymap` の fd 送信（server→client）。
+Wayland 側のコードは両者で完全に同一。起動時に自動選択し、
+`process_spawn_with_arg` の引数 `panel` / `hosted` で強制もできる。
 
-- [ ] 旧・方式決定メモ（参考）:
-  - (a) `libwayland-server`（同梱済み）を使うネイティブ ImplusOS アプリを新設し、
-        `wl_display` / `wl_compositor` / `wl_shm` / `xdg_wm_base` / `wl_seat` /
-        `wl_output` を実装、クライアントの `wl_shm` バッファを
-        `com.ImplusOS.windowmanager` のシーングラフへブリッジ。
-  - (b) Weston を外来 Linux バイナリとして持ち込み（headless/fbdev バックエンド）。
-        udev/dbus/input 依存が重い。
-  - → 既定は (a)。`libwayland-server` は AF_UNIX + `wl_display` イベントループなので
-     ImplusOS の `IPC/UnixSocket.c` + epoll 互換で動くはず（要検証）。
-- [ ] `$XDG_RUNTIME_DIR/wayland-0`（`/tmp/wayland-0`）で listen。
-      envp の `XDG_RUNTIME_DIR=/tmp` は G2 で設定済み。
-- [ ] `wl_shm` プール = `memfd_create` + `mmap`（TmpFS `/dev/shm` 経路、glibc port
-      で実装済み）。共有メモリのクロスプロセス可視性は
-      `TODO_glibc_Port.md` セッション10 の遅延コミット mmap の制約に注意。
-- [ ] キーボード/ポインタは `com.ImplusOS.windowmanager` の入力ルーティングから
-      `wl_keyboard` / `wl_pointer` へ変換。xkbcommon のキーマップは
-      同梱 `libxkbcommon` + データ（`xkeyboard-config` を `packages.lock` に追加）。
+**WM が死んでも生き延びる**: hosted 動作中に `window_get_wm_pid()` が負に
+なったら panel へ自動昇格する。全サーフェスのピクセルは commit 時に
+compositor 側へコピー済みなので、クライアントを繋いだまま画面だけ引き継げる。
+
+**ファイル構成**（`Userland/Application/com.ImplusOS.waylandcompositor/`）:
+
+| ファイル | 内容 |
+|---|---|
+| `Compositor.h` | 共有型（クライアント／オブジェクト表／シーン／出力） |
+| `Wayland.c` | ワイヤプロトコル一式。`wl_display`/`wl_registry`/`wl_callback`/`wl_compositor`/`wl_region`/`wl_shm`(+pool,+buffer)/`wl_surface`/`wl_seat`(+pointer,+keyboard)/`wl_output`/`wl_subcompositor`/`wl_data_device_manager`/`xdg_wm_base`/`xdg_positioner`/`xdg_surface`/`xdg_toplevel`/`xdg_popup` |
+| `Compositor.c` | シーン（スタック順・フォーカス・配置）、合成、出力／入力バックエンド、メインループ |
+| `Tests/` | **ホスト側ハーネス**（下記） |
+
+**G3 第1弾からの主な変更点**:
+- **複数クライアント**（最大 4）。オブジェクト表をクライアント毎に持つ。
+- **複数トップレベル + `xdg_popup`**。自前のスタック順・クリックフォーカス・
+  カスケード配置。ポップアップは `xdg_positioner` のアンカー矩形＋オフセットで配置。
+- **入力を実装**（U3 消化）。`wl_seat` は version 5 で pointer+keyboard を公開し、
+  `wl_pointer` の enter/leave/motion/button/axis/**frame**、`wl_keyboard` の
+  keymap/enter/leave/key/modifiers/repeat_info を送る。
+  set-1 スキャンコード → evdev キーコードは 0x01–0x58 が恒等、0xE0 系は表引き。
+- **`wl_keyboard.keymap` の fd 送信**（旧「未了」）。ネイティブプロセスには
+  `memfd_create` が無いので、**カーネルに `SYSCALL_MEMFD_FROM_SHM`(273) を新設**し
+  （`SYSCALL_MEMFD_SHM_HANDLE` の逆）、共有メモリを memfd に包んで SCM_RIGHTS で渡す。
+  keymap 本体は include 4 行だけの約 200 バイトで、クライアント側の libxkbcommon が
+  同梱 `/usr/share/X11/xkb` から 34 KiB へ展開する。
+- **`wl_shm` プールの寿命管理**。GTK は buffer を切り出した直後に pool を destroy
+  するので、マッピングをオブジェクトとは別に参照カウントする。受け取った memfd は
+  map 後に close（カーネルの共有オブジェクトは全体で 256 個しかない）。
+- **サーフェスのピクセルは commit 時にコピー**して即 `wl_buffer.release`。
+  これで任意のタイミングで再合成でき、クライアント終了後も画が残る。
+- **frame コールバックは合成後にまとめて返す**（約 60 Hz）。即返しだと
+  クライアントが全力で描き続ける。
+- **部分送信の握り潰しを排除**。イベントが途中で切れるとクライアントの
+  パーサが恒久的にずれるため、時間予算付きで送り切り、駄目なら接続を落とす。
+- `wl_display.delete_id` を destroy 要求すべてに対して返す。
+- ポインタ・スプライトを自前で描く（panel には WM のカーソルが無い）。
+
+### G3.5 — ホスト側ハーネス（`Tests/`）【新規 2026-09-04】
+
+`Compositor.c` / `Wayland.c` は ImplusOS の syscall ラッパ越しにしか外界に
+触らないので、その面だけ差し替えれば **Linux ビルドホストでもそのままコンパイル
+できる**。`Tests/HostShim.c` が AF_UNIX を実ソケットに、共有メモリハンドルを
+`memfd_create` に、出力を PPM ダンプに繋ぐ。
+
+これで**イメージに同梱するのと同一の Debian `gtk3-demo` バイナリ**を、
+本物の `libwayland-client` 経由で、本物の compositor コードに接続して
+動かせる。オペコード違いや引数長違いは QEMU 起動 1 回ではなく `gcc` 1 回で分かる。
+
+```
+make linux_runtime_stage                 # 一度だけ
+Userland/Application/com.ImplusOS.waylandcompositor/Tests/run.sh
+```
+
+`WLC_TRACE=1` でリクエスト毎の 1 行トレース（`-DWLC_PROTOCOL_TRACE`）、
+`WLC_INPUT=<file>` でポインタ／キーボードのスクリプト入力。
+
+ハーネスで**カバーできない**もの: hosted バックエンド、WM 消滅時の panel 昇格、
+そしてカーネル自身の AF_UNIX / SCM_RIGHTS / 共有メモリ実装。これらは QEMU が要る。
 
 ### G4 — GTK 実行時データの補完
 
-- [ ] gdk-pixbuf `loaders.cache`（§1 の対策案）。
-- [ ] `xkeyboard-config`（`/usr/share/X11/xkb`）を `packages.lock` に追加、xkbcommon 用。
-- [ ] 最小 `hicolor` + 必要なら `Adwaita` の一部アイコン（サイズ検討）。
-- [ ] `/usr/share/gtk-3.0/settings.ini`（`gtk-font-name` を DejaVu に、
-      `gtk-icon-theme-name=hicolor`）。
+- [x] gdk-pixbuf のローダ群 + `loaders.cache`（2026-09-05）。追加パッケージは
+      不要だった: `gdk-pixbuf-query-loaders` は `libgdk-pixbuf-2.0-0` の deb に
+      同梱されている。`stage-gtkdata.sh` がローダ 11 本を
+      `/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/` へ置き、
+      同梱の ld.so 越しに同梱の query-loaders を走らせてキャッシュを生成し、
+      STAGE_DIR 接頭辞を落としてゲスト上のパスに直す。
+      `glibc_envp` に `GDK_PIXBUF_MODULE_FILE` / `GDK_PIXBUF_MODULEDIR` も追加。
+      **注**: png / jpeg は Debian のビルドでは libgdk_pixbuf 本体に組み込み
+      （loaders/ に無いのはそのため）なので、§5 の PNG 問題はこのキャッシュ
+      不在が原因ではない（ホストでキャッシュを外しても gtk3-demo は描画できる）。
+- [x] `xkeyboard-config`（`/usr/share/X11/xkb`）: Xorg 側の staging で既に入っていた。
+- [x] `adwaita-icon-theme`（2026-09-05）: **カーソルテーマは必須**だった。GDK は
+      GSettings の `cursor-theme`（既定 "Adwaita"）を libwayland-cursor に渡し、
+      読めなければ `cursor_theme_name` を NULL のままにしておいて、後から
+      `_gdk_wayland_display_get_scaled_cursor_theme()` でそれを `g_assert` する。
+      deb は 500 KiB で、アイコンも一緒に入る。
+- [x] `shared-mime-info` の `mime.cache`（2026-09-05）: gdk-pixbuf は画像形式の
+      判定を自前の署名比較ではなく GIO の `g_content_type_guess()` で行うので、
+      MIME データベースが無いと**ローダも画像データも正しいのに**
+      "Unrecognized image file format" になる（§5）。
+- [ ] `/usr/share/gtk-3.0/settings.ini`（`gtk-font-name` を DejaVu に）。実害は
+      出ていないので保留。
 
 ### G5 — 起動検証マイルストーン（QEMU、ユーザー側）
 
@@ -171,11 +232,24 @@ $ ld-linux-x86-64.so.2 --library-path <stage>/usr/lib/x86_64-linux-gnu \
       正常終了。glibc + GTK3 スタック 約60本のロード・再配置・初期化、
       GSettings/フォント/locale 読み込み、pthread 生成、GLib メインループ、
       `gtk_init` まで in-OS で通ることを確認。
-- [ ] **W2**: 最小コンポジタ起動、`wayland-info` 相当（`weston-info` を
-      `packages.lock` に追加）が `wl_compositor` / `wl_shm` / `xdg_wm_base` を列挙。
-- [ ] **W3**: `gtk3-demo` のメインウィンドウが `com.ImplusOS.windowmanager` 上に描画。
-- [ ] **W4**: `gtk3-widget-factory` でウィジェット・テーマ・フォント描画が崩れない。
-- [ ] **W5**: ポインタ/キーボード入力がクライアントに届き、ボタン等が反応。
+- [x] **W2〜W5 相当をホストで確認（2026-09-04、`Tests/run.sh`）**。イメージに
+      同梱するのと同じ Debian バイナリを、本物の `libwayland-client` 経由で
+      本物の compositor コードに繋いだ結果:
+      - `gtk3-demo` がレジストリ交換 → `xdg_toplevel` → `wl_shm` バッファ commit まで
+        通り、ヘッダバー・サイドバー・ノートブック・フォントまで完全に描画（W3/W4）。
+      - ポインタ移動＋クリックでリスト選択が変わり、タイトルと右ペインが追従（W5）。
+      - Down キー 2 回で選択が Assistant → Benchmark → Builder に移動。
+        keymap fd（SCM_RIGHTS）→ libxkbcommon → evdev マッピングが通っている証拠（W5）。
+      - `gtk3-widget-factory` が全ウィジェットを描画し、コンボボックスのクリックで
+        `xdg_popup` が親の真下に出る。
+      - `gtk3-demo` と `gtk3-icon-browser` の同時接続でカスケード配置される。
+- [x] **W2'〜W5'**（2026-09-05、セッション21–22）: QEMU 実起動で
+      `gtk3-demo` がウィンドウを描画し、ポインタ入力に応答する。
+      ヘッダバー・デモ一覧・ノートブック・本文まで、ホスト・ハーネスと同じ絵が
+      hosted バックエンド（WM のウィンドウ 1 枚）の中に出る。リストをクリック
+      すると選択とタイトルが追従する。到達までに潰したバグは §4。
+- [ ] **W6**: WM を落として panel バックエンドへの昇格を確認、
+      および WM 不在ブートでの `panel` 直起動。
 
 ### G6 — syscall ギャップ埋め（運用）
 
@@ -203,20 +277,85 @@ G3 の要**、`TODO_Chromium_LinuxABI.md` と共通）、`memfd_create` の
 
 ## 3. リスク / 未解決
 
-- **`SCM_RIGHTS`（AF_UNIX の fd パッシング）が未実装**。Wayland の `wl_shm` /
-  dmabuf / `wl_data_device` は fd を `sendmsg` の補助データで渡す。G3 の前提条件。
-  `Kernel/IPC/UnixSocket.c` に補助データ経路の追加が要る。
-- **共有メモリのクロスプロセス・コヒーレンシ**。`TODO_glibc_Port.md` の
-  「VFS にページキャッシュ無し」「遅延コミット mmap は VMA 木無し」の制約下で
-  `wl_shm` プールをコンポジタ・クライアント間で正しく共有できるかは要実証。
-- **単一 ISO サイズ**。GTK3 閉包でステージは 232→**254 MiB**。`INSTALL_DISK_IMAGE_SIZE_MB`
-  = 2560 の余裕内。xkeyboard-config / アイコンで G4 が +数十 MiB。
-- **QEMU 実起動がこの環境で不可**。W1〜W5 はユーザー検証。実装側の完了線は
-  ビルド通過＋ステージ実体でのホスト素振り＋トレース設計まで。
+- ~~**`SCM_RIGHTS` が未実装**~~ → K2（セッション20）で受信側、
+  `SYSCALL_MEMFD_FROM_SHM`（G3 完了時）で送信側が揃った。
+- ~~**共有メモリのクロスプロセス・コヒーレンシ**~~ → 実証済み。クライアントが
+  描いた `wl_shm` プールがそのまま compositor 側で読めている（§4 #9〜#12）。
+- **`wl_shm` プールの拡張は予約分まで**。昇格時に 2 冪（最低 1 MiB）で確保し、
+  その範囲でしか伸ばせない（共有オブジェクトは真のリサイズができない）。
+  超えると `[memfd] grow past reservation` を出して失敗する。真のリサイズには
+  既存マッピングの張り替えが要る。
+- **単一 ISO サイズ**。GTK3 閉包 + MIME DB + Adwaita でステージは約 **310 MiB**。
+  `INSTALL_DISK_IMAGE_SIZE_MB` = 2560 の余裕内。
+- **QEMU 実起動は TCG（この環境に `/dev/kvm` の権限が無い）**。起動からデスクトップ
+  まで約 90 秒、`gtk3-demo` のウィンドウが出るまで更に数分かかる。KVM が使える
+  環境なら桁で速くなるはず。
 
 ---
 
-## 4. 参照
+## 4. 修正したカーネル/ランタイム側のバグ（セッション21–22、2026-09-05）
+
+QEMU 実起動で `gtk3-demo` を起動し、詰まるたびに原因を特定して潰した記録。
+どれも GTK3 固有ではなく、外来 Linux ABI 全体に効く。
+
+| # | 症状（クライアント側から見えたもの） | 原因 | 修正 |
+|---|---|---|---|
+| 1 | レジストリ 264 バイトを完全に受信した直後に恒久停止。要求を一切送らない | `recvmsg(2)` が `flags` を無視。libwayland は **`MSG_DONTWAIT`** で読むのに、EAGAIN が「ブロッキング再試行」に化けてイベントキューが空になった瞬間に固まる | `Syscall_LinuxCompat.c`: `recvmsg` / `recvfrom` で `MSG_DONTWAIT` を尊重 |
+| 2 | クライアントが子プロセスを spawn した直後に compositor のソケットが `rx-BADF` に | AF_UNIX の fd が**全プロセス共通の番号空間**なのに `close()` に所有者チェックが無く、`posix_spawn` の子が glibc の closefrom フォールバックで他プロセスのソケットまで閉じていた | `UnixSocket.c`: `unix_socket_close()` は `owner_pid` が呼び出し元のときだけ閉じる |
+| 3 | `GLib-CRITICAL: Failed to get RW lock: Resource deadlock avoided` が出続け、GSettings 初期化が無限ループ | `LINUX_CLONE_PARENT_SETTID` が **`0x00008000`（= `CLONE_PARENT`）**、正しくは `0x00100000`。新規スレッドの glibc `pd->tid` が 0 のままになり、rwlock が「未保持ロックの `__cur_writer`(=0) == 自分の tid(=0)」を自己デッドロックと誤検知 | 定数を修正 |
+| 4 | fontconfig がキャッシュを `/tmp` に書く所でカーネルが `free()` 内で #PF | カーネル `realloc()` のその場拡張が隣の空きブロックを吸収するとき `block->next` は書くのに**新しい後続ブロックの `prev` を直していない** | `Memory_Main.c`: splice の両端を直し、`heap_search_hint` も追従 |
+| 5 | （潜在）ライブラリのデータがゼロで読める | ファイルマッピング表が全プロセス共有 256 件、GTK3 クライアント 1 つで **291 件**登録して静かに溢れる | `FileMap.c`: 1024 件へ。溢れとショートリードを可視化 |
+| 6 | `gtk_init` の途中で無反応（syscall も出さない） | D-Bus が無いのに `DBUS_SESSION_BUS_ADDRESS` も無く、GDBus が `dbus-launch` を `posix_spawn` して待ち続ける | `glibc_envp` に `DBUS_SESSION_BUS_ADDRESS` / `NO_AT_BRIDGE` |
+| 7 | ローダも画像データも正しいのに `Unrecognized image file format` で `g_assert` 死 | gdk-pixbuf は形式判定に GIO の `g_content_type_guess()` を使う。**shared-mime-info の `mime.cache` が無いと何も名乗り出ない** | `stage-gtkdata.sh` が同梱の `update-mime-database` で生成 |
+| 8 | `Failed to load cursor theme Adwaita` → `cursor_theme_name` の `g_assert` 死 | カーソルテーマが 1 つも無い | `adwaita-icon-theme` を vendoring |
+| 9 | `wl_shm` バッファが 1 つも作れない（=カーソルテーマも読めない） | `fallocate(2)` が ENOSYS。libwayland は `memfd_create` + `posix_fallocate` でプールを作るので、glibc の手書きフォールバックがゼロ長 memfd に書けず失敗する | `Syscall_LinuxCompat.c`: `fallocate` を実装 |
+| 10 | プールの**拡張**が `ftruncate grow on shm-backed memfd unsupported` で失敗 | 共有メモリオブジェクトはリサイズ不可 | 昇格時に 2 冪（最低 1 MiB）で予約し、その範囲内の拡張を許可。compositor 側に `wl_shm_pool.resize` を実装（新設の `SYSCALL_SHARED_MEMORY_SIZE` で予約量を確認してから受理） |
+| 11 | `SCM_RIGHTS: shared_memory_grant failed` | 共有メモリの所有者判定が**スレッド単位の pid**。GTK は memfd を作ったスレッドと fd を送るスレッドが違う | `SharedMemory.c`: 同一性をアドレス空間（`process_memory_owner_pid_of`）で判定 |
+| 12 | `[wl] create_pool without an fd`（fd の値が **0** で届く） | libwayland は fd を送る前に `fcntl(fd, F_DUPFD_CLOEXEC, 0)` で複製する。ImplusOS はファイル表に 0/1/2 を持たないので**空きに見えて fd 0 を返し**、しかも memfd の複製が `g_memfds[]` を引き継がず shm backing を失っていた | `Syscall_File.c`: dup は 3 番から探す。memfd の複製は memfd 状態を複写して共有オブジェクトの参照を取る |
+
+**持ち込んだ計測手段**（今後の bring-up 用に残してある）:
+
+- `Wayland.c`: `-DWLC_PROTOCOL_TRACE` のリクエスト・トレースに上限
+  （`WLC_TRACE_MAX`、既定 600 行）。COM1 は 1 バイト 1 syscall なので、
+  上限が無いとトレース自体が測りたいタイミングを変えてしまう。
+  bind したインタフェース名は常時ログ。
+  compositor の Makefile に `WLC_EXTRA_CFLAGS` フック。
+- `UnixSocket.c`: `rx-EAGAIN` はトレースしない（ポーリングで即座に上限を
+  食い潰し、肝心の tx/rx が見えなくなっていた）。上限 512。
+- `Syscall_LinuxCompat.c`: `-DLINUX_SYSCALL_TRACE` は **AF_UNIX を触るまで
+  発火しない**（ld.so の 4 万 syscall を飛ばす）。上限 `LINUX_TRACE_MAX` 行。
+- `IDT_Main.c`: #PF ダンプに `pid=` と、KASLR スライドを割り出すための
+  既知シンボルの実行時アドレスを追加。
+- `Kernel/Source/Makefile`: strip 前の ELF を `Kernel_Main.ELF.sym` として残す
+  （スライドを引けば `nm` / `objdump` でフォルト RIP が関数名になる）。
+- `Tests/run.sh`: フォント / GSettings / gdk-pixbuf の探索先を全部ステージ側に
+  向ける。以前はビルドホストの GTK を拾っていて、イメージに無いデータでも
+  ハーネスが通ってしまっていた。
+
+---
+
+## 5. 追試の作法: ゲスト内プローブ
+
+§4 の #7 は「ローダはある・データも正しい・それでも判定が失敗する」という
+外から見分けのつかない状態で、カーネル側をいくら覗いても分からなかった。
+決め手はゲスト内でライブラリに直接問い合わせる小さな Linux バイナリで、
+ビルドホストの gcc で `-ldl` だけリンクして `/usr/bin` に置き、
+`com.ImplusOS.gtk3demo` の起動先をそれに差し替えて動かした:
+
+```c
+void *h = dlopen("libgdk_pixbuf-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+GSList *(*get_formats)(void) = dlsym(h, "gdk_pixbuf_get_formats");
+/* 登録済み 13 形式（png/jpeg 含む）を列挙 → ローダ不在ではない  */
+/* gdk_pixbuf_loader_new_with_type("png") は成功 → デコーダも健全  */
+/* gdk_pixbuf_new_from_file() だけ失敗    → 判定（sniffing）だけが壊れている */
+```
+
+ここまで絞れて初めて `g_content_type_guess()` と MIME データベースに辿り着けた。
+同種の「ライブラリの内部状態を知りたい」場面ではこの手が一番速い。
+
+---
+
+## 6. 参照
 
 - glibc 動的リンク基盤: [`TODO_glibc_Port.md`](TODO_glibc_Port.md)（実装ログ §11 セッション1–15）
 - カーネル Linux ABI 拡充: [`TODO_Chromium_LinuxABI.md`](TODO_Chromium_LinuxABI.md)

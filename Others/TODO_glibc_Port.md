@@ -1236,3 +1236,48 @@ libxkbcommon は include dir を `access(dir, R_OK|X_OK)` で検査し、EACCES 
 `make kernel` 通過。次の起動で xkbcommon がキーマップをコンパイルできて
 クラッシュしないはず。`gdk_display_open` を抜けてウィンドウ表示へ。
 残: `GLib: ... to "e"` の調査、カーソルテーマ、実描画確認。
+
+### 2026-09-04 セッション24（compositor を WM から独立した表示サーバに ＋ ホスト側ハーネス）
+
+要望「GTK3 アプリが既存の WM から独立して動くように」。セッション20 の
+compositor は `while (window_get_wm_pid() < 0) process_yield();` で WM を待ち、
+WM ウィンドウ 1 枚に blit するだけだったので、WM が無いと**永久にハング**し、
+入力も一切届かなかった（`wl_seat` の caps=0）。
+
+**方針**: compositor を自己完結した表示サーバにし、WM を 2 つある出力
+バックエンドの片方に格下げする。詳細は
+`TODO_GTK3_Wayland_LinuxABI.md` §G3 / §G3.5。
+
+**カーネル**
+- `SYSCALL_MEMFD_FROM_SHM`(273) ＋ `syscall_memfd_from_shm()` を新設
+  （`Syscall_File.c`、`SYSCALL_MEMFD_SHM_HANDLE` の逆）。共有メモリハンドルを
+  memfd に包み、参照を 1 つ取る。ネイティブプロセスには `memfd_create` が無い
+  ので、`wl_keyboard.keymap` の fd を SCM_RIGHTS で渡すにはこれが要る。
+- `Syscall_File.h`: `syscall_file_is_pipe()` の宣言を追加。定義は
+  `Syscall_File.c` にあったが宣言が無く、作業ツリーの
+  `Syscall_LinuxCompat.c:4068` が implicit-declaration で**カーネルビルドを
+  落としていた**（G3 とは無関係の既存不具合）。
+
+**Userland**
+- `os_memfd_from_shm()` ラッパ（`Syscalls.c` / `Memory.h` / libc の syscall 番号）。
+- compositor を 3 ファイルに再構成（`Compositor.h` / `Wayland.c` / `Compositor.c`）。
+  panel / hosted バックエンド、複数クライアント、複数トップレベル、`xdg_popup`、
+  pointer + keyboard、プール寿命管理、frame ペーシング、部分送信の排除。
+- `com.ImplusOS.gtk3demo/Start.c`: `sleep_ms(1500)` の当て推量をやめ
+  `unix_socket_is_listening("/tmp/wayland-0")` で待ち合わせ。既に上がっている
+  compositor は再利用し、自分で起動したものだけ落とす。引数でクライアントの
+  パスと `panel` 強制を受け付ける。
+
+**検証**（`Userland/Application/com.ImplusOS.waylandcompositor/Tests/`）
+ホストで `Compositor.c` + `Wayland.c` をそのままビルドし、イメージ同梱と
+同一の Debian `gtk3-demo` / `gtk3-widget-factory` / `gtk3-icon-browser` を
+実 `libwayland-client` 経由で接続。描画・ポインタ・キーボード・ポップアップ・
+複数クライアントまで確認（`TODO_GTK3_Wayland_LinuxABI.md` §G5 W2〜W5）。
+この過程で実際に見つかって直った不具合:
+`wl_keyboard.leave` のオペコード違い（3→2）、`wl_output.release`（3→0）、
+`wl_data_source.destroy`（0→1）、`wl_shm.create_pool` の引数長（fd は
+ワイヤ上 0 バイト）、送信バジェットが反復回数で切ってあったための
+イベント切り詰め。**いずれも QEMU 起動 1 回ずつ潰す種類のもの**。
+
+残り: QEMU 実起動での再現（カーネルの AF_UNIX/SCM_RIGHTS/共有メモリはホストでは
+代替されている）、hosted バックエンド、WM 消滅時の panel 昇格。
