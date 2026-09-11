@@ -1,5 +1,67 @@
 # ImplusOS に Chromium を実用動作させるための TODO リスト
 
+> **現況追記 (2026-09-06) — QEMU 実起動でのヘッドレス bring-up:**
+>
+> この日、初めて **QEMU 実機起動での逐次デバッグ**ができた（KVM 有効）。
+> `Userland/Application/Chromium/Chromium.ELF`（`--headless=new --dump-dom
+> about:blank`）を GUI 操作なしで走らせるため、init に
+> `/Userland/autostart.list`（1 行 1 ELF、既定では未配置）を追加し、
+> `make image_livecd AUTOSTART=/Userland/Chromium/Chromium.ELF` で焼く。
+>
+> **結果**: Chromium は起動し、ポリシー/variations/プロファイル/signin/
+> 拡張機能（PDF Viewer 等）/Mojo/PartitionAlloc/NSS/GLib/ANGLE フォールバック
+> まで通るようになった。**`-smp 1` では 10 分以上まったく落ちない**。
+> `-smp 2` 以上では 15〜90 秒でメモリ破壊由来の SIGSEGV に至る（下記 §10）。
+>
+> **本セッションで潰した実バグ**（いずれも Chromium 固有ではなく、Linux ABI
+> 全般に効く）:
+>
+> 1. **`open("/proc/self/fd/<n>")` 未実装** — Chromium の共有メモリは memfd
+>    (`O_RDWR`) で、ReadOnlySharedMemoryRegion の読み取り専用ハンドルは
+>    `open("/proc/self/fd/<n>", O_RDONLY|O_CLOEXEC)` で作られる
+>    (`base::subtle::CreateAnonymousRegion`)。ProcFS は readlink しか対応して
+>    おらず open が失敗していた。`syscall_file_reopen_fd()` を新設し、
+>    同じオブジェクトを別 fd に別アクセスモードで張り直す。
+> 2. **`fcntl(F_ADD_SEALS)` / `F_GET_SEALS` 未実装** — 失敗すると Chromium は
+>    「この kernel の memfd は使えない」と判断して一時ファイル経路に落ちる。
+>    `kernel_memfd_t.seals` を追加、SEAL_SEAL と SHRINK/GROW を ftruncate で
+>    強制。
+> 3. **`open(path, O_RDWR|O_CREAT)` が新規作成時に `O_WRONLY` を返す** —
+>    `syscall_file_creat()` が固定で `O_WRONLY` open していた。
+>    `PlatformSharedMemoryRegion::TakeOrFail()` は `fcntl(F_GETFL)` で
+>    アクセスモードを検査して CHECK 失敗＝ブラウザ即死。`syscall_file_creat_ex()`
+>    を新設し呼び出し側のフラグで開く。
+> 4. **futex の待ちスロット枯渇と非 Linux errno** — スレッド消滅時にスロットが
+>    解放されず 128 個を食い潰し、`FUTEX_WAIT` が `-ENOMEM` を返していた。
+>    glibc の `futex_wait()` は 0/EAGAIN/EINTR 以外を `futex_fatal_error()`
+>    （"The futex facility returned an unexpected error code."）で致命扱いに
+>    するのでプロセスが死ぬ。スロット数を `OS_CONFIG_PROCESS_MAX_COUNT` に、
+>    死んだ待ち手の GC（`futex_gc_locked()`）を追加、枯渇時は EINTR。
+> 5. **`shared_memory_map()` の参照カウント漏れ** — 同一アドレス空間が同じ
+>    オブジェクトを 2 回 map すると同じアドレスを返すが `references` を増やさず、
+>    片方の unmap で領域が解放されていた。`shared_mapping_t.map_refs` を追加。
+> 6. **`munmap()` が共有メモリの帳簿を見ていない** — Linux ABI の munmap は
+>    `process_user_munmap()` に直行しており、shm の mapping 表にアドレスが
+>    残ったままユーザアロケータへ返却されていた。次に同じオブジェクトを map
+>    すると、すでに他人のものになった stale アドレスが返る。
+>    `shared_memory_unmap_any()` を追加して munmap から呼ぶ。
+> 7. **`madvise(MADV_DONTNEED/FREE)` が no-op** — PartitionAlloc は
+>    「decommit した領域は次に読むと 0」という Linux の挙動に依存し
+>    (`DecommittedMemoryIsAlwaysZeroed()` が true)、recommit 時に memset を
+>    省く。結果 `calloc()` が汚れたメモリを返し、libxcb の
+>    `xcb_connection_t.setup` がゴミポインタになって `free()` で #GP。
+>    mmap アリーナ内の**プライベート無名ページのみ**その場でゼロ化する実装に
+>    変更（ファイル裏付け／共有ページは Linux 同様に内容を保持）。
+> 8. **SMP の偽ページフォルト** — 他 CPU が張ったばかりのページに対して古い
+>    TLB エントリで faulting するのは x86 では正常で、OS 側が許容する必要が
+>    ある。`paging_access_is_now_permitted()` を追加し、既に許可されている
+>    アクセスなら invlpg して再開する（従来はプロセスを終了させていた）。
+>
+> **副次的な改善**: `Chromium/Start.c` の `--v=1` を既定オフに
+> (`-DCHROMIUM_VERBOSE_LOG=1` で復活)。VERBOSE1 の数千行を 115200 baud の
+> COM1 に流すのが起動時間を支配していた。
+
+
 > **現況追記 (2026-08-29):**
 > - Linux ABI 互換レイヤーの実体は P6 リファクタで移動済み。現在のパスは
 >   **`Kernel/Compat/Linux/Syscall_LinuxCompat.c`**（本文中の
@@ -354,3 +416,315 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 - [ ] **最初のマイルストーン**: `x86_64-linux-gnu` でコンパイルした `/bin/busybox` または `/bin/dash`、そして本命の `/Userland/com.ImplusOS.chrome/chrome --headless=new` の実行（§6 / P3）。ここで顕在化した `ENOSYS` を `Syscall_LinuxCompat.c` に随時追加する。
 - [ ] **TLS/スレッド**: glibc の NPTL は `set_robust_list`/`rseq`/`clone(CLONE_SETTLS)` を使用（いずれもカーネル側実装済み）。`FUTEX_LOCK_PI`/`UNLOCK_PI` も §3.6 で実装済み（所有権プロトコルのみ、優先度継承は無し）。`robust list` の実死亡時処理（`FUTEX_OWNER_DIED` の伝播）は未検証。
 - [~] **`__libc_start_main` の auxv 依存**: `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_ENTRY`/`AT_BASE`/`AT_PAGESZ`/`AT_RANDOM`(16B)/`AT_SECURE`/`AT_UID`〜`AT_EGID`/`AT_EXECFN` は既に積まれていることを確認。本セッションで **`AT_HWCAP`(CPUID leaf1 EDX) と `AT_CLKTCK`(`timer_hz()`、0 なら 100)** を追加(`initialize_elf_user_stack_ex`)。実バイナリでの通し検証は QEMU ブートが前提のため未実施。
+
+---
+
+## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
+
+`-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では
+15〜90 秒で必ず死ぬ。死に方は毎回違う（NULL / 3 / 0xFFE7CE… といったゴミ
+ポインタへの書き込み、PartitionAlloc の `FreeInUnknownRoot` でのゴミ free、
+`base::sequence_manager` 内の NULL デリファレンス）。**症状が非決定的で
+CPU 数に依存する**ので、機能不足ではなくカーネルの SMP レースである。
+
+### 10.-4 追記 (2026-09-08, 夜) — 停止中のスレッド状態を実測。inotify は無関係だった
+
+`-DPROCESS_STALL_DUMP=1`（タイマ駆動。syscall が止まると既存の
+`[hb]` ヒートビートは出ないので、タイマから叩く）で停止中の全スレッドの
+状態と最後に発行した Linux syscall 番号を採取した。結果:
+
+```
+[stall] free=0xD083D  0:s2 1:s6 2:s6 3:s6 4:s6 5:s6
+        6:s2:#0xE8:n0x7BD2      <- Xorg,    epoll_wait を 31,698 回
+        7:s1:#0xE8:n0x2C69      <- chrome,  epoll_wait を 11,369 回
+```
+
+（`s` は `PROCESS_STATE_*`: 1 READY / 2 RUNNING / 6 BLOCKED。`#` は最後の
+syscall 番号、`n` は発行回数。）
+
+わかったこと:
+
+- **Xorg も Chromium も `epoll_wait`(232) を回し続けている**。デッドロックでは
+  なく、イベントループの往復レートがそのままスループットの上限になっている。
+  他のスレッドは全部 BLOCKED で、正常。
+- **`inotify` は無関係**だった（§10.-3 の推測は外れ）。止まる位置が
+  `file_path_watcher_inotify.cc` の直後に見えたのは、単にそれ以降ログを出す
+  コードが少ないだけ。
+- **メモリ枯渇でもない**。停止中も空き 3.2 GB（`free=0xD083D` ページ）。
+
+**計測環境の注意**: ゲスト RAM を 8 GB にすると 1.08 GB の ISO がホストの
+ページキャッシュから追い出され、起動時間が 15 秒 → 200〜300 秒に化ける。
+`-m 4096` にすると再現性のある数字が出る（`MEM=4096`）。
+
+**現状**:
+
+| 構成 | 挙動 |
+|---|---|
+| デスクトップ `-smp 4` / `-smp 16` | 21〜26 秒で起動、安定 |
+| Chromium `-smp 1` | 落ちないが遅い。ログ 1 行 / 実時間 1 分程度で進む。signin までは到達、描画には未到達 |
+| Chromium `-smp 2` 以上 | Xorg/Chromium の起動中に無音でリセット（トリプルフォルト）。再現は非決定的 |
+
+**残る 2 つの課題**（どちらも未解決）:
+
+1. **epoll/poll の往復レート**。`EPOLL_POLL_SLICE_MS`(8) と
+   `POLL_WAIT_MAX_DECLINES`(1) の組み合わせで、待ちの半分が必ずスライス分
+   眠る。両方を緩める実験はしたが、当時は下記 2 の影響と混ざって評価できな
+   かった。2 を先に潰してから再評価するのが正しい順序。
+2. **`-smp >1` での無音リセット**。二重フォルトのパニック出力すら出ないので
+   トリプルフォルト。以下は実測で**排除済み**:
+   - TLS の取り違え（全スレッドの `fs_base` は相異なる）
+   - syscall のスピン（400 秒で 100 万回未満）
+   - ELF ロードのコスト（exec → `main()` が 6 秒）
+   - AP の IST/TSS 未設定（`ap_entry_c()` が per-CPU に設定済み）
+   - 物理メモリ枯渇（3.2 GB 空き）
+   - カーネルスタックの use-after-free と、実行中アドレス空間の破棄
+     （どちらも §10.-2 で修正済み。それでも残る）
+
+### 10.-3 追記 (2026-09-08, 後半) — 描画には未到達。止まる位置は毎回同じ
+
+GUI（`--ozone-platform=x11`）でウィンドウ枠は出るが、**ページは描画されない**。
+`-smp 4` で観測される停止位置は毎回まったく同じで、Chromium のログは
+
+```
+ERROR:base/files/file_path_watcher_inotify.cc:925] Failed to read /proc/sys/fs/inotify/max_user_watches
+ERROR:dbus/bus.cc:405] Failed to connect to the bus: ... /run/dbus/system_bus_socket
+ERROR:dbus/bus.cc:405] Failed to connect to the bus: ... /nonexistent
+```
+
+の 3 行で止まる（Xorg 側は生きていて dbus 再接続を 10 秒ごとに出し続ける）。
+そこから先へ進まないか、20〜60 秒後にゲストが無音でリセットする。
+
+**次に当たるべき有力な線**: `inotify` が**イベントを一切配送しない**こと
+（§4）。`inotify_init` は「空マスクの signalfd」＝**永久に readiness が立たない
+ディスクリプタ**を返す実装なので、そこを待つスレッドは永久に待つ。止まる位置が
+`file_path_watcher_inotify.cc` の直後で毎回一致するのは偶然にしては出来すぎて
+いる。VFS に変更通知のフックを入れて実イベントを流すか、少なくとも
+`inotify_init` の fd を「常に readable（読むと 0 件）」にして待ちが解ける形に
+するのが最短の検証になるはず。
+
+**排除できた仮説**（いずれも実測で確認済み、再調査不要）:
+
+- TLS の取り違え — `-DTHREAD_TLS_TRACE=1` で全スレッドの `fs_base` を出力。
+  すべて相異なり、8.4 MB 間隔で正しく並んでいた。
+- syscall のスピン — `-DLINUX_SYSCALL_PROFILE=1` で計数。400 秒で 100 万回に
+  届かない。
+- ELF ロードのコスト — exec 発行から Chromium の `main()` 到達まで **6 秒**。
+- OS の起動 — 電源からデスクトップまで **14〜20 秒**（`-smp 4` / `-smp 16`）。
+- AP の IST/TSS 未設定 — `ap_entry_c()` は `init_gdt()` /
+  `init_idt_per_cpu()` を呼んでおり、#DF は IST1 で per-CPU に張られている。
+
+### 10.-2 追記 (2026-09-08) — 起動時間の内訳と、SMP のリセット源 2 件
+
+**まず計測した**（`-smp 4`、ホストのページキャッシュを温めた状態）:
+
+| 区間 | 実時間 |
+|---|---|
+| 電源 → デスクトップ（loginui が WM を起こす） | **14〜18 秒** |
+| → `chrome` の exec 発行 | +4 秒 |
+| → Chromium の `main()` 到達（465 MB の ELF ロード＋ld.so 完了） | **+6 秒** |
+| → ブラウザ初期化開始 | +0 秒 |
+
+つまり **OS の起動も 465 MB の ELF ロードも遅くない**。当初「9 分かけても
+起動しない」と書いたのは誤りで、実体は次の 2 つだった:
+
+1. **ホストのページキャッシュ**。1.08 GB の ISO を焼き直した直後の初回起動は
+   195〜296 秒かかるが、2 回目は 16 秒。イメージを作り直したあとに計測すると
+   ゲストが遅いように見える。計測前に `dd if=... of=/dev/null` で温めること。
+2. **ゲストのリセット**。Chromium 起動の 4〜60 秒後に、シリアルに何も出さずに
+   マシンが再起動していた（＝トリプルフォルト）。
+
+`[sysprof]`（`-DLINUX_SYSCALL_PROFILE=1`）で syscall 数を数えたところ、
+400 秒で 100 万回に届かない。**syscall ループで焼いているのではない**。
+
+**リセット源として直したもの**:
+
+- **カーネルスタックが使用中に解放されていた**。スレッドを reap する CPU と、
+  そのスレッドをまだ実行していた CPU は別で、`free()` されたスタックのページが
+  即座に他の用途へ回っていた。CPU ごとに 1 個だけスタックを退避する仕組み
+  (`g_parked_stack`) はあったが、埋まっていると次の死亡は無防備になる。
+  **カーネルスタックはプロセススロットが保持して再利用する**ようにした
+  （解放しない）。スレッド生成から 128 KiB の malloc も 1 つ消える。
+- **実行中のアドレス空間が破棄されていた**。`release_process_resources()` は
+  他 CPU で実行中のスレッドを `continue` で飛ばしたあと、共有 CR3 の
+  ページテーブルを**無条件に** `paging_destroy_process_space()` していた。
+  Chromium は数十スレッドを 4 CPU に散らしたまま終了するので毎回踏む。
+  実行中のスレッドが残っている場合は破棄を見送る（数ページのリークと引き換えに
+  リブートを避ける）。
+
+**それでも Chromium はブラウザ初期化の途中で極端に遅くなる**、あるいは
+V8 のレンダラスレッドで `Check failed: isolate_->...CentralStack...` に当たる。
+GUI（`--ozone-platform=x11`）ではウィンドウ枠までは出るが、ページは描画されない。
+
+### 10.-1 追記 (2026-09-07, 後半) — **SMP のメモリ破壊は解消**
+
+原因は SMP レースではなく、**アドレス指定の取り違え**だった。
+
+`Arch/x86_64/mmu/Paging_Main.c` の `resolve_pd_table(cr3, pdpt_index)` は
+`pdpt_index = (addr >> 30) & 0x1FF` だけでページディレクトリを引いていた。
+つまり **PML4 インデックスを見ていない**。すべてのユーザ写像が 512 GiB 未満に
+あった頃はそれで足りたが、mmap アリーナが `USER_MMAP_BASE`（1 TiB =
+PML4 スロット 2）へ移った時点で破綻していた:
+
+- アリーナのアドレスが **PML4 スロット 0 側の無関係なアドレスの PD** に解決される
+- `paging_unmap_range()` はその PD を歩き、**実行体がそこに張っていたフレームを
+  解放**し、最後に PD エントリごと 0 にする
+- 2 MiB 単位で写像が消え、次に触ると demand-zero の新品ゼロページが返る
+  → NULL ポインタ、ゼロで埋まった構造体、ゼロ領域への jmp
+
+PartitionAlloc はアリーナを絶え間なく munmap するので、被害量は
+「Chromium がどこまで進んだか」に比例した。`-smp 1` で無傷だったのは
+レースだからではなく、単に遅くてそこまで到達しなかったから。
+
+**確認方法**（再利用可能）: `-DPAGING_LOST_MAPPING_TRACE=1` でビルドすると、
+コード領域 (`0x40_0000_0000`–`0x40_8000_0000`) に demand-zero フォルトが来た
+時点で `[lostmap]` としてページテーブルの状態を吐く。実行体の PT_LOAD は
+ELF ローダが eager にマップするので、ここに demand-zero が来ること自体が
+「写像が消えた」証拠になる。`pde=0x0` かつ `pd_alloc=1`（テーブル自体は
+確保済み）から、PD エントリが明示的に 0 にされたと特定できた。
+
+**修正**: `walk_pd_table(cr3, virt_addr)` / `refresh_pdpt_entry()` を新設し、
+実ページテーブルを PML4 から歩くようにした。PML4 盲目だった
+`resolve_pd_table()` と `update_pdpt_user_flag()` は削除（同じ罠を再度
+踏まないため）。
+
+破壊が止まった結果、Chromium は以前落ちていた地点を越え、そこから先は
+**機能不足**で止まるようになった。以下は続けて直したもの:
+
+- **`getrlimit(2)` が read-only ページへ書けてしまう** — Chromium の
+  `base::internal::CheckMemoryReadOnly()` は「`mprotect(PROT_READ)` した
+  ページを `getrlimit` の出力バッファに渡し、**EFAULT が返ること**」で保護を
+  検証し、返らなければ `CHECK` で落とす
+  (`protected_memory_posix.cc:46`)。カーネルは読み取り専用のユーザページにも
+  書けてしまうので素通りしていた。`paging_user_range_is_writable()` /
+  `process_user_buffer_is_writable()` を追加し、`getrlimit`/`prlimit64` の
+  出力と `read(2)` の書き込み先で検査する。
+  *`copy_to_user()` 全体でこれを行うのが本筋だが、データを返すすべての
+  syscall にページテーブル walk が乗って体感で遅くなるため見送っている。*
+- **共有メモリの mmap が毎回同じアドレスを返す** — `shared_memory_map()` は
+  同一アドレス空間からの 2 回目の map で既存の写像を使い回す（ネイティブの
+  `SYS_SHM_MAP` は冪等な契約で、コンポジタがそれに依存している）。しかし
+  `mmap(2)` はそうではなく、Chromium の `base::SharedMemoryTracker` は
+  マップ先アドレスをキーに記録して unmap 時に `CHECK` する
+  (`shared_memory_tracker.cc:62`)。Linux 経路だけ `shared_memory_map_new()`
+  で毎回新しい範囲を張るようにした。
+
+- **`memfd_create` / `eventfd2` がフラグを検証していない** — Mojo は
+  `ChannelLinux::KernelSupportsUpgradeRequirements()` で
+  `memfd_create(name, 0xFFFFFFFF)` と `eventfd2(-1)` を**わざと不正なフラグで
+  呼び**、EPERM/EINVAL/ENOSYS のいずれかで失敗することを要求する
+  (`channel_linux.cc:947`)。フラグを無視して成功していたので `CHECK` で落ちて
+  いた。既知ビット以外は EINVAL にし、`MFD_CLOEXEC` も反映するようにした。
+- **memfd のシールが強制されていない** — `F_SEAL_WRITE`/`F_SEAL_FUTURE_WRITE`
+  を記録するだけで `write()` を止めていなかった。また封印された `ftruncate`
+  は Linux では **EPERM** だが EACCES を返していた（Mojo の検査は EPERM 系し
+  か受け付けない）。
+
+**現在の到達点 (`-smp 4`, headless)**: メモリ破壊なし（`[lostmap]` 0 件）、
+カーネルパニックなし、Chromium の FATAL なし。ブラウザは
+`WebContentsViewAura` すなわち実際のコンテンツ層まで進むようになった。
+そこから先は **V8 のレンダラスレッドで
+`Check failed: isolate_->...CentralStack...`** で停止する（`ImmediateCrash()`
+の `int3`/`ud2` を踏む）。V8 がスレッドのスタック境界を
+`pthread_getattr_np()` 経由で取得し、それが実際の RSP と合っていないのが
+疑わしい（`/proc/self/maps` の stack 行は固定定数から合成している。§3.3）。
+
+**速度も課題**。`-smp 4` で 9 分回しても起動が終わらない。支配的なのは
+epoll/poll の 8ms スリープ（`Syscall_Epoll.c` の設計上の制約、§3.4）と、
+ブロックデバイス I/O。
+
+### 10.0 追記 (2026-09-07, 前半) — SMP 修正 2 件（破壊は当時継続）
+
+**修正 1: USB マスストレージの転送に排他が無かった**（`Drivers/Bus/USB/USB_Main.c`）。
+`MassStorage.c` は全コマンドで **1 個のバウンスバッファ**・CBW タグ・
+選択中デバイス番号を共有し、しかも CBW → データ → CSW の 3 段転送を行う。
+`filemap_handle_fault()` は（ブロックドライバがブロックしてよいように）
+意図的にロックを落としてから読むので、**複数 CPU が同時にこのドライバへ入る**。
+結果、シーケンスが交錯し、互いのバウンスバッファの中身を読み取る＝
+**ページに他のフォルトのデータが入る**。デマンドページングが増えるまで顕在化
+しなかっただけで、Chromium (465 MiB) はこれを大量に踏む。
+`usb_storage_read/write/flush` を「譲るロック」で直列化した（転送中に
+`timer_msleep()` でスケジューラへ譲るため、スピンロックでは自己デッドロック
+する）。直列化のコストは `FILEMAP_READAHEAD_PAGES` を 16→64（256 KiB）に
+拡大し、`pmm_alloc_pages()` 失敗時に 1 ページへ落ちるのをやめて半減リトライに
+することで相殺した。
+
+**修正 2: TLB シュートダウン**（§10.1、下記）。CPU ごとの要求スロット＋
+確認応答待ちに作り直し、**待ち先を「その CR3 を実際に載せている CPU だけ」に
+限定**した（PCID 無しの x86 では CR3 ロードで TLB 全体がフラッシュされるので、
+他のアドレス空間を走らせている CPU は古い翻訳を持ち得ない）。計測では
+IPI 1 回あたりの待ちは平均 ~540 スピン、最大 ~87k スピンで、実用上問題ない。
+
+**測定結果 (`-smp 4`, headless, `--dump-dom about:blank`)**:
+
+| | 修正前 | 修正後 |
+|---|---|---|
+| デスクトップ起動 (`-smp 4` / `-smp 16`) | 可 | 可（回帰なし） |
+| `-smp 1` の Chromium | 落ちない | 落ちない（回帰なし） |
+| `-smp 4` の Chromium | quota DB 付近で SIGSEGV | **同じ深さまで到達するが依然 SIGSEGV** |
+
+つまり **SMP のメモリ破壊はまだ残っている**。上の 2 件はいずれも実在する
+データ破壊バグで、直す価値はあったが、Chromium を殺している主因ではなかった
+（あるいは主因の一部でしかなかった）。次に当たるべきところは §10.3。
+
+### 10.1 TLB シュートダウンが非同期かつ排他なし（修正済み）
+
+`Arch/x86_64/smp/SMP_Main.c` の `smp_tlb_shootdown()` には**独立した 2 つの
+欠陥**があった。
+
+1. **確認応答を待たない。** IPI を投げてすぐ戻る。呼び出し元はその直後に
+   ページを解放したり、保護を狭めたり、アドレス範囲をアロケータへ返したり
+   する。他の CPU はまだ古い翻訳を持っているので、そこへ書き続ける。
+2. **要求スロットがグローバルに 1 個で排他がない。** 2 CPU が同時に
+   シュートダウンすると `vaddr`/`pages` を上書きし合い、片方のフラッシュが
+   丸ごと失われる。
+
+Chromium は数十スレッドが 4 CPU の上で mmap/mprotect/munmap を絶え間なく
+呼ぶので、両方が常時起きる。`-smp 1` で無傷、`-smp >1` で破壊、という観測と
+完全に一致する。
+
+**対処**: `smp_tlb_shootdown_cr3(cr3, vaddr, pages)` に作り直した。
+
+- CPU ごとの要求スロット `g_tlb_slot[]` ＋応答行列 `g_tlb_seen[][]` で (2) を解消。
+- 全 CPU が応答するまで戻らない（(1) を解消）。
+- 待ち先は `g_cpu_cr3[]`（`paging_switch_cr3()` が公開）と照合し、**その
+  アドレス空間を載せている CPU だけ**に限定。PCID 無しの x86 では CR3 ロードで
+  TLB 全体がフラッシュされるので、これで正しさは保たれ、16 vCPU 構成でも
+  待ちが現実的になる。
+- 待機中の CPU は `tlb_service_peers()` で相手の要求も処理するので、
+  同時シュートダウンでデッドロックしない。
+- `spinlock_lock()` は待機中（64 回に 1 回）`smp_tlb_poll()` を呼ぶ。この
+  カーネルのスピンロックはほぼ全て割り込み禁止で取られるため、待っている
+  CPU はシュートダウン IPI を受け取れず、そのままでは送信側と待ち合う。
+
+**重要な副次的発見**: 「権限を広げる方向の変更ではシュートダウンを省く」
+最適化を入れると Chromium が前進しなくなる。古い制限的な TLB エントリが
+残ったままフォルトを繰り返すためで、`paging_access_is_now_permitted()` の
+偽フォルト処理だけでは足りない。**PTE が変化したら必ずシュートダウンする**
+こと（`paging_protect_user_range` は 1 ページごとではなく範囲でまとめて 1 回）。
+
+### 10.2 調査済みで**シロ**だったもの
+
+- `process_user_reserve()` / `process_user_alloc()` — いずれも
+  `g_process_table_lock` の下でバンプ割り当て。重複配布はない。
+- コンテキストスイッチでの `fs_base`/`gs_base` 退避・復元
+  (`process_schedule_*` ↔ `activate_process_context()`) — 対になっている。
+- 偽ページフォルト — §上記 8 で対処済み（単体では SMP 破壊は止まらない）。
+
+### 10.3 次に当たるところ
+
+- `Syscall_File.c` の fd テーブル: `syscall_file_read()`/`write()` などが
+  `g_file_table_lock` を取る前に `g_files[fd].used` を読む箇所がある。
+- `paging_map_user_page()` のシュートダウン条件
+  （`replaced_live_mapping` のときだけ）。
+- `filemap_handle_fault()` の同一ページ同時フォルト（2 CPU が同じページを
+  同時に埋める経路）。
+
+再現手順:
+
+```bash
+make image_livecd AUTOSTART=/Userland/Chromium/Chromium.ELF
+# 落ちる（15〜90 秒）
+make run_uefi_usb QEMU_DISPLAY=none
+# 落ちない
+make run_uefi_usb QEMU_DISPLAY=none QEMU_SMP=1
+```

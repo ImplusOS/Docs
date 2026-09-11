@@ -1,7 +1,7 @@
 # Boot Sequence — ImplusOS
 
-*Last reviewed: 2026-08-29 (reflects P3/P4/P5 of `Docs/Others/TODO_OS_Refactor.md`;
-the 19-phase list re-verified against `Kernel/Core/kernel_main.c`).*
+*Last reviewed: 2026-09-11 (reflects P3/P4/P5 of `Docs/Others/TODO_OS_Refactor.md`;
+the 20-phase list re-verified against `Kernel/Core/kernel_main.c`).*
 
 ## 1. From firmware to `kernel_main`
 
@@ -18,10 +18,10 @@ kernel stack (see `hal_arch_switch_stack_and_jump()`), then everything else
 happens in `kernel_main_after_stack_switch()`, which is instrumented
 phase-by-phase with `boot_profile_begin()`/`boot_profile_end(name, ...)`.
 
-## 2. The 19 boot phases
+## 2. The 20 boot phases
 
 In order, as recorded in `g_boot_profile[]` (`KERNEL_BOOT_PROFILE_MAX = 64`
-slots, only 19 used today):
+slots, only 20 used today):
 
 | # | Phase name | What happens | Key call(s) |
 |---|---|---|---|
@@ -41,9 +41,10 @@ slots, only 19 used today):
 | 13 | `display_init` | Framebuffer/GPU driver selection | `driver_manager_display_init()` |
 | 14 | `process_manager` | Process table, scheduler | (process manager init) |
 | 15 | `kernel_services` | Remaining kernel-internal services | |
-| 16 | `userland_elf` | Loads and starts `Userland.ELF` (the init process — spawns WindowManager, Shell, apps) | ELF loader + `process_manager_create()` |
-| 17 | `driver_module_deferred` | Non-critical-path module init deferred from phase 9 | `driver_module_init_deferred()` |
-| 18 | `audio_network_init` | Audio subsystem + network stack bring-up, plus `Kernel/Drivers/Module/NetworkBuiltinDrivers.c` registration | `audio_manager_init()`, `network_stack_init()`, `network_builtin_drivers_register()` |
+| 16 | `boot_handoff_anim` | Freezes the boot spinner, then scales the captured boot screen to 150% while dissolving it to black, leaving the panel black for the init process to grow its own first screen out of. Skipped when `OS_CONFIG_BOOT_FADE` is 0, and costs `OS_CONFIG_BOOT_FADE_MS` when it is not | `load_bar_stop()`, `boot_anim_play_handoff()` |
+| 17 | `userland_elf` | Loads and starts `Userland.ELF` (the init process — spawns WindowManager, Shell, apps) | ELF loader + `process_manager_create()` |
+| 18 | `driver_module_deferred` | Non-critical-path module init deferred from phase 9 | `driver_module_init_deferred()` |
+| 19 | `audio_network_init` | Audio subsystem + network stack bring-up, plus `Kernel/Drivers/Module/NetworkBuiltinDrivers.c` registration | `audio_manager_init()`, `network_stack_init()`, `network_builtin_drivers_register()` |
 
 Phase 8 is the single most important dependency boundary in this list: it is
 the earliest point at which `DeviceRegistry` exists, which is why ACPI/Timer
@@ -59,7 +60,8 @@ driver" rationale.
 `kernel_main.c` calls `boot_profile_dump("boot")` once boot completes,
 writing one line per phase to the serial console (COM1, 115200 baud). A real
 capture (QEMU, OVMF, q35, from this refactor's own regression testing) looks
-like:
+like — this one predates the `boot_handoff_anim` phase, so it ends at 18 and
+the indices from `userland_elf` on are one lower than the table above:
 
 ```
 [boot:profile] reason=boot count=19
