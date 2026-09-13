@@ -427,6 +427,335 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 `base::sequence_manager` 内の NULL デリファレンス）。**症状が非決定的で
 CPU 数に依存する**ので、機能不足ではなくカーネルの SMP レースである。
 
+### 10.-6 追記 (2026-09-13) — **Chromium がブラウザ UI を描画し、動き続けるようになった**
+
+タブストリップ・オムニボックス・ツールバー・about:blank のページ領域まで
+描画され、起動から 6 分経っても落ちない。下の 4 件が効いた。§10.-5 の
+epoll / タイマ修正が前提。
+
+#### (a) `sched_getaffinity` がスレッド ID を受け付けなかった（これが描画の本命）
+
+```c
+int32_t current = process_get_current_pid();          /* = アドレス空間の所有者 */
+if (pid != 0u && (int32_t)pid != current) return LINUX_ESRCH;
+```
+
+Linux のこの API の "pid" は**スレッド ID** で、glibc はそれに依存している:
+`pthread_getattr_np()` は内部で `__pthread_getaffinity_np()` →
+`sched_getaffinity(pd->tid, ...)` を呼ぶ。所有者 pid と比べていたので、
+**メインスレッド以外からの呼び出しが全部 ESRCH** になっていた。
+
+この errno 1 個で Chromium は描画できなかった。glibc は affinity のエラーを
+そのまま返し、V8 の `base::Stack::GetStackStart()` はスレッドのスタック境界を
+取得できず、`Heap::CollectGarbage()` の冒頭にある
+`CHECK(isolate_->IsOnCentralStack())` が落ちる。つまり**レンダラスレッドで
+最初に GC が走った瞬間に Chromium が abort** していた:
+
+```
+# Fatal error
+# Check failed: isolate_->IsOnCentralStack().
+#4  v8::internal::Heap::CollectGarbage(...)
+#5  v8::internal::HeapAllocator::CollectGarbageAndRetryAllocation(...)
+#9  v8::internal::Runtime_AllocateInYoungGeneration(...)
+```
+
+修正 (`Compat/Linux/Syscall_LinuxCompat.c`): `linux_sched_pid_is_self()` を
+追加し、0・自スレッド・所有者・**同一スレッドグループの兄弟スレッド**を
+受け付ける。`sched_setaffinity` と `prlimit64` も同じ規則に揃えた
+（どちらも同じ比較をしていた）。
+
+**症状の切り分けに使った手順**（同種の問題に再度当たったとき用）:
+1. `[OS] [#GP]` のユーザスタックダンプに V8 のメッセージ文字列が載っている。
+   リトルエンディアンで復号すると `Check failed: isolate_->IsOnCentralStack()`。
+2. バックトレースの `#0` が `base::debug::CollectStackTrace` なのは既知なので、
+   `nm` 出力 (`chrome.syms`) 中のその symbol の vaddr との差でロードベースが
+   出る。この環境では **0x4000000000**（`[code]` 窓の先頭）。
+3. 残りのフレームを同じベースで引くと上の呼び出し列になる。
+
+#### (b) `madvise(MADV_DONTNEED)` が読み取り専用ページに書き込んでいた
+
+ゼロを読ませるためにその場で memset していた（§3.8 の経緯）。しかし
+PartitionAlloc は span を decommit するとき **`mprotect(PROT_NONE)` の後に**
+`madvise(MADV_DONTNEED)` を呼ぶので、対象は往々にして書き込み不可。
+カーネルモードの書き込みが present・読み取り専用のページで fault し、
+`PAGE_FAULT: Page fault in kernel mode` でマシンが落ちていた
+（`CR2=0x16201300000`, `pte=0x800000004B194065` = P=1/RW=0/U=1/NX, `lastsys=28`）。
+
+修正: Linux と同じく**ページを破棄する**（`paging_unmap_range()`、連続する
+区間ごとに 1 回だけシュートダウン）。次のアクセスでゼロフォルトするので
+呼び出し側が読む値は変わらず、フレームは返り、読み取り専用ページへ書かなく
+なる。
+
+**副作用**: 破棄したページは absent になり、デマンドゼロ経路は absent な
+ユーザページを「プログラムが最後に指定した保護」を見ずに書き込み可能で
+マップする。したがって `mprotect(PROT_NONE)` + `madvise()` で decommit した
+span は、フォルトせずアクセス可能なゼロとして読める。PROT_NONE で捕まえる
+はずの use-after-free が見逃される。これは PROT_NONE 予約の未触ページに
+ついては元から同じ（`Arch/x86_64/cpu/IDT_Main.c` のデマンドページング
+コメント参照）。領域ごとの保護を持つのが両方まとめた本筋の直し方。
+
+#### (c) `fcntl` のロック系コマンドが `ENOTSUP` だった
+
+LevelDB は DB を開く前に `<db>/LOCK` を `fcntl(F_SETLK)` で押さえる。
+`F_GETLK`/`F_SETLK`/`F_SETLKW` と OFD 版が未実装だったため、**Chrome
+プロファイルを構成する 20 個以上の DB が全滅**し、ブラウザは
+「Something went wrong when opening your profile.」のダイアログ付きで
+起動していた。
+
+修正: `F_SETLK`/`F_SETLKW`/`F_OFD_SETLK`/`F_OFD_SETLKW` は無条件に成功、
+`F_GETLK`/`F_OFD_GETLK` は `l_type = F_UNLCK`（競合なし）を返す。
+**これは実装ではなく割り切り**で、カーネルはロック表を持たない。単一の
+ロック取得者が期待する契約だけを満たす（LevelDB はプロセス内の二重ロックを
+自前の表で防いでいる）。別プロセスが同じ DB を開くのは止められない。
+
+#### (d) CPL3 由来のフォルトでカーネルがパニックしていた
+
+`general_protection_fault_handler()` は `from_user && pid >= 0` のときだけ
+プロセスを殺し、それ以外はパニックしていた。`process_get_current_pid()` は
+**アドレス空間の所有者**を返すので、マルチスレッドプロセスが最後のスレッドを
+畳んでいる最中（`release_process_resources()` が
+"threads still running on other CPUs" で破棄を遅延している窓）は解決できず、
+**ユーザ空間の CHECK 失敗がカーネルパニックになっていた**（レポートの RIP が
+ユーザアドレスなのが目印）。
+
+修正 (`Arch/x86_64/cpu/IDT_Main.c`):
+- `from_user` なら pid/tid が引けなくてもパニックしない。引けるならスレッドを
+  終了させ、引けなければこの CPU を再スケジュールに回す。
+- ページフォルトも同様。加えて**ユーザアドレスに対するカーネルモードの
+  フォルト**は、サービスできなければそのプロセスを SIGSEGV で終了させる
+  （memcpy の途中は巻き戻せないので再開はできないが、デスクトップは生き残る）。
+- 診断として、諦める直前に PTE のフラグ・file-backed か否か・その
+  スレッドの最後の Linux syscall 番号を出す。これが (b) の特定に直結した。
+
+#### (e) `POLL_WAIT_MAX_DECLINES` を 1 に戻した
+
+セッション途中（撤回したカーネル内待機ループの作業中）に 1 → 8 に上げてい
+たのを元に戻した。`poll_wait_park()` は「スキャン中にイベントが来ていた」と
+判断するとスリープを見送るが、generation はグローバルなので、待機者が複数
+いると毎回トリップする。8 だと最大 8 回連続でスリープを飛ばし、実質的な
+スピンになる。
+
+実測（アイドル待機中の syscall/秒、SMP=4）:
+
+| スレッド | declines=8 | declines=1 |
+|---|---|---|
+| chrome (main) | 1,300 | 329 |
+| Xorg | 316 | 83 |
+
+#### 到達点（SMP=4, MEM=4096, QEMU/KVM、出荷構成＝診断なし・`--v=1` なし）
+
+| 経過 | 状態 |
+|---|---|
+| 〜25 s | デスクトップ（WM）起動 |
+| 〜80 s | Chromium (X11) ウィンドウの全面描画 |
+| 180 s | **ブラウザ UI 完成**（タブ・オムニボックス・ツールバー・空白ページ） |
+| 390 s | 変化なし・生存（`#GP` 0 件、パニック 0 件、プロファイルエラー 0 件） |
+
+#### 残っている既知の問題
+
+- ログに残る唯一のエラーは LevelDB の `SyncParent`（4 件）。
+  `open("<dir>", O_RDONLY)` がディレクトリを開けないため。動作への影響はない。
+- 起動時間のばらつきが大きい（同じイメージで UI 到達が 150〜400 秒超）。
+  内訳の大半は Xorg の起動で、ホスト側の負荷にも左右される。
+- **プリエンプションが syscall 境界にしか無い。** `process_timeslice_expired()`
+  を見ているのは `Syscall_Dispatch.c` の 1 箇所だけで、タイマ割り込みからの
+  切り替え経路が無い（`process_schedule_on_syscall()` は syscall フレームの
+  `saved_rsp` を差し替える方式なので、割り込みフレームからは再開できない）。
+  CPU バウンドなユーザスレッドは syscall を出すまで CPU を離さない。
+  現状の Chromium は poll ループで頻繁に syscall を出すので露見しにくいが、
+  スケジューラの素性としてはここが一番の穴。統一した切り替え経路を入れるのが
+  次の大きめの仕事。
+- `-no-reboot` だけで QEMU を回すと、実行によっては途中で QEMU が rc=0 で
+  終了する。`-d cpu_reset` は起動時の 8 件しか出ないのでリセットではなく
+  **ゲストからのシャットダウン要求**。計測には `-no-shutdown` を併用のこと
+  （`runq.sh` に追加済み）。
+- AP のタイマ割り込みは CPU0 以外で早期 return され捨てられている（§10.-5）。
+
+### 10.-5 追記 (2026-09-12) — epoll の 2 バグを修正。Chromium が初めてページを描画した
+
+**結論: Chromium が X11 ウィンドウにピクセルを出すようになった。** 描画が
+止まっていた原因は Chromium 側ではなく、カーネルの epoll に 2 件のバグが
+あったこと。どちらも「マシン全体がアイドルなのに誰も前進しない」という
+同じ症状に見えるため、fd レベルのダンプを足すまで切り分けられなかった。
+
+#### (a) `epoll_ctl(ADD)` が不正な fd を受け入れていた → X サーバが CPU を独占
+
+`syscall_epoll_ctl()` は fd を一切検証していなかった。一方
+`epoll_poll_fd()` は「どのテーブルにも属さない fd」に `EPOLLERR` を返し、
+`EPOLLERR` はレベル/エッジに関係なく必ず報告される。つまり**ゴミ fd が 1 個
+入るだけで `epoll_wait()` が永久に即時復帰する**。
+
+実測: Xorg の epoll セットに `fd = -22`（`= -EINVAL` をそのまま fd として
+登録したもの）が入っていた。出どころは Xorg の `dbus-core` モジュールで、
+`/run/dbus/system_bus_socket` への接続に失敗した戻り値を `SetNotifyFd()` に
+fd として渡している（10 秒ごとに再試行するので永続する）。
+
+```
+[epoll] 0x4000 n=6 ... fd4294967274/w0x00000001/r0x00000008
+```
+
+結果、Xorg が 1 CPU を丸ごと燃やし、SMP=2 では Chromium が READY のまま
+5 秒に数 syscall しか進めない（餓死）。
+
+修正 (`Core/syscall/Syscall_Epoll.c`):
+- `epoll_fd_is_addressable()` を追加し、負の fd とどのテーブルにも属さない
+  fd を `EBADF` で弾く（Linux の契約どおり）。
+- 併せて `ADD` の重複を `EEXIST`、`MOD`/`DEL` の未登録を `ENOENT`、未知の
+  `op` を `EINVAL` にした（いずれも黙って成功していた）。
+
+効果: Xorg の syscall 数が 300 秒あたり **226,251 → 3,268**。状態も
+RUNNING 固定から BLOCKED になった。
+
+#### (b) EPOLLET を「ポーラ側のレベル変化」で模倣していた → X サーバが永久に待つ
+
+`epoll_check_once()` のエッジ判定は `ready & ~last_ready` だった。これは
+**ポーラが観測した瞬間のレベル遷移**であって、Linux が エッジを立てる
+「データ到着」ではない。レベルが立ったままの 2 回目の到着は遷移として
+見えないので、**エッジが永久に出なくなる**。
+
+実測: Xorg はクライアントソケットを `EPOLLET|EPOLLIN`（`w=0x80000001`）で
+登録する。Chromium の要求 20 バイトがカーネルのリングに滞留したまま、
+Xorg もChromium も眠り続けた。
+
+```
+[epoll] 0x4000 ... fd200/w0x80000001/r0x00000001   ← 読めるのに配送されない
+[usock] fd200 own=6 peer=199 c q=20                ← 20 バイト滞留
+[poll]  tid7 fd199/w0x00000001/r0x00000004         ← Chromium は応答待ち
+```
+
+修正:
+- `IPC/UnixSocket.c`: `unix_sock_t` に `rx_seq` を追加。受信キューへの追記
+  ごとにインクリメントし、`unix_socket_rx_seq()` で公開する。これが
+  「到着イベント」そのもの。
+- `Core/syscall/Syscall_Epoll.c`: `epoll_entry_t` に `last_seq` を追加し、
+  ET の配送条件を
+  `(ready & ~last_ready) | (seq != last_seq ? ready : 0) | (ready & (ERR|HUP))`
+  にした。カウンタを持たない種類の fd は `seq` が常に 0 なので従来動作。
+
+効果: X の往復レイテンシがサブミリ秒に戻り、Chromium が `PutImage` で
+ピクセルを送り始めた。
+
+#### 失敗した試み — epoll/poll/select の「カーネル内待機ループ」
+
+`epoll_wait` が 1 ms ごとに 0 を返してユーザ空間から再発行される形が
+syscall の無駄だと考え、syscall 内で「スキャン→park→再スキャン」を
+回す形に書き換えた。**これは悪化させた**（Xorg の起動が 20 秒 → 170 秒、
+X の往復が 2〜11 秒）。
+
+理由: **`process_sleep_current_ms()` はブロックしない。** BLOCKED を立てて
+起床期限を記録し `process_scheduler_request_reschedule()` を呼んで*戻る*
+だけで、実際の切り替えはユーザ空間に戻る途中で起きる
+(`process_run_next_on_current_cpu()` は `enter_user_mode()` への片道
+ジャンプで、呼び出しから戻らない)。したがってこれをループで囲んでも
+スリープはせず、**プロセスを BLOCKED と表示したまま全速でスピンし、
+毎周で自分の起床期限を書き換える**。要求はソケットに載ったまま、サーバは
+CPU を燃やして「待っている」ふりをする。
+
+`Syscall_Epoll.c` 冒頭のコメントにこの理由を明記した。1 周だけ park して
+0 を返す既存の形が、このスケジューラでは正しい。
+
+#### 診断の追加（すべて既定で無効）
+
+`-DPROCESS_STALL_DUMP=1` に加えて:
+- ハートビートを**スレッド単位**にした（従来は `process_get_current_pid()`
+  = メモリ所有者単位で、Chromium の全スレッドが 1 スロットに集約されて
+  「chrome は生きている」以上のことが分からなかった）。スレッド名・最後の
+  syscall 番号・第1引数・ユーザ復帰 RIP・累計回数を出す。
+- `-DPROCESS_STALL_DUMP_FDS=1` で `[epoll]`（各 epoll セットの fd と現在の
+  readiness）、`[poll]`（空振りした poll の fd セット）、`[usock]`（各
+  AF_UNIX 端点の滞留バイト数）、`[wire]`（直近 48 件の送受信と先頭 4 バイト、
+  ms タイムスタンプ付き）を出す。X プロトコルを直読みできるので、
+  「要求が届いていない」のか「応答が来ていない」のかが確定する。
+  **タイマ割り込みからの大量シリアル出力なので、測定したい時間そのものを
+  歪める。計測用の実行では必ず切ること。**
+
+#### (c) LAPIC タイマの校正が PIT 依存で、ブートごとに最大 17.7 倍ずれていた
+
+`lapic_switch_to_local()` (`Arch/x86_64/timer/LAPIC_Timer.c`) は LAPIC タイマ
+の周波数を PIT ティック 10 回分で測っていた。問題は 2 つ:
+
+1. `g_ticks` をタイマ開始**前**に読んでいた（それだけで約 10% 誤差）。
+2. より致命的に、**`g_ticks` が 10 進むことは実時間が 10 周期経ったことを
+   意味しない**。起動中は割り込み禁止区間が長く、その裏に溜まった PIT 割り
+   込みが解除直後にまとめて到着する。窓が数十マイクロ秒に潰れ、`elapsed`
+   が極小になり、LAPIC にその分だけ短い周期が設定される。
+   `elapsed < 1000` のガードは 100 倍の誤りを通してしまう。
+
+実測（QEMU, SMP=4, 要求 250 Hz）:
+
+| 実行 | 実際のティック率 | 要求比 |
+|---|---|---|
+| A | 250 Hz | 1.00x |
+| B | 286 Hz | 1.14x |
+| C | **4439 Hz** | **17.7x** |
+
+4439 Hz は割り込み処理だけでマシンを潰す。**Chromium の起動時間が同じ
+イメージで一桁ばらついていた主因はこれ。**
+
+修正: HPET で校正する（自由走行カウンタなので遅延も滞留もしない。
+`timer_monotonic_ns()` が既に信頼している）。50 ms の窓で LAPIC カウンタの
+減少量を測り、`per_second / g_timer_hz` を周期に使う。HPET が無い機械では
+従来の PIT 方式に落ちるが、その場合もティックはカウンタ開始**後**に読む。
+
+効果: `initial` がブート間で 249,864 / 249,874（誤差 0.004%）に安定。
+ティック率も要求比 1.014x に収まった（従来 1.00〜17.7x）。
+
+#### (d) ゲストの CLOCK_MONOTONIC がティックカウンタ由来で約 14.5% 速かった
+
+`clock_monotonic_now()` は `timer_ticks() / timer_hz()` を使っていた。これは
+「想定した割り込み率」の精度しかなく、(c) の校正ずれもそのまま乗る。HPET
+と比べて約 14.5% 速く、Xorg の起動直後のログが `[ 886.996]`（実際は 200 秒
+程度）になっていた。
+
+修正 (`Core/syscall/Syscall_Clock.c`, `Syscall_Futex.c`, `Syscall_File.c`):
+- MONOTONIC 系はすべて `timer_monotonic_ns()`（HPET 優先）由来にした。
+- futex タイムアウトと timerfd の「起動からの ms」も同じ基準に統一。
+  同じ時計を読んでから相対タイムアウトを指定する呼び出しが正しく動く。
+- `clock_getres` は HPET がある場合に 1 µs を報告する（従来はティック周期
+  = 4 ms。これを丸め単位に使う呼び出しがティック単位で余分に待っていた）。
+
+効果: Xorg の初回ログが `[ 886.996]` → `[ 17.465]`、400 秒の実行で最終
+タイムスタンプが実時間と一致（362 秒）。
+
+#### 効果（(c)+(d) 適用後）
+
+Chromium がブラウザ起動を完走するようになった。同一実行のログで:
+
+- Blink レンダラが JS モジュールを実行（`modulator_impl_base.cc`）
+- ツールバー WebUI を構築（`chrome://webui-toolbar.top-chrome/strings.m.js`）
+- Privacy Sandbox の attestation を 263 件パース
+- プロファイルの LevelDB を開く
+
+それ以前は `scheduler_loop_quarantine_config` の 2 行で止まっていた
+（ログ 7 行 → **260 行**）。
+
+#### 現状と残り
+
+- SMP=4 で Chromium のウィンドウ全面が描画される（起動から約 78 秒）。
+  修正前は SMP=2 で約 420 秒、SMP=4 では届く前に落ちていた。
+- ページ内容（ツールバー・about:blank の中身）までは未到達。
+- 描画直後に `Chrome_InProcRendererThread` が user-mode #GP で落ちる
+  (`rip=0x400EA9B161` — ImplusOS ネイティブ userland のコード領域)。
+  (e) で Chromium 側の NOTREACHED は消えたので、これは別要因。次の当たり所。
+- **カーネル側の堅牢性**: 上の #GP で chrome が exit した直後、
+  `[proc] address space kept: threads still running on other CPUs` の状態で
+  残存スレッドが同じ命令をフォルトし、ユーザフォルトとして処理されずに
+  カーネルパニック（`[OS] [PANIC] Fatal exception / general_protection`）に
+  なる。死にかけのプロセスのスレッドは終了させるべきで、パニックさせて
+  はいけない。
+- 進行が約 14.5 秒周期で途切れていたのは (c) のタイマ暴走が主因。
+- SMP=4 で「静かなリセット」は**再現しなかった**（`-d cpu_reset` の 8 件は
+  すべて起動時の power-on / AP INIT）。
+- AP のタイマ割り込みは `lapic_timer_handler()` / `timer_core_handler()` が
+  CPU0 以外を早期 return するため捨てられている。`process_on_timer_tick()`
+  は CPU0 でしか走らないので、AP 上の CPU バウンドなスレッドがプリエンプト
+  されるかは割り込み復帰パス依存。未検証。ここは次の候補。
+- headless (`--headless=new --dump-dom`) は Chromium 自身の
+  `FATAL: ui/gl/init/gl_factory_ozone.cc:62] NOTREACHED hit. Expected Mock
+  or Stub, actual:0` で落ちる。SwANGLE が `DisplayVkXcb` を選び
+  `xcb_connect()` に失敗して GL 実装が None になるため。`--use-gl=stub`
+  を渡すのが筋（未検証）。
+
 ### 10.-4 追記 (2026-09-08, 夜) — 停止中のスレッド状態を実測。inotify は無関係だった
 
 `-DPROCESS_STALL_DUMP=1`（タイマ駆動。syscall が止まると既存の
