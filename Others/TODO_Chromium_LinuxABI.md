@@ -427,6 +427,85 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 `base::sequence_manager` 内の NULL デリファレンス）。**症状が非決定的で
 CPU 数に依存する**ので、機能不足ではなくカーネルの SMP レースである。
 
+### 10.-7 追記 (2026-09-13, 夜) — ウォームリセット後の KSTACK パニック修正、ランチャーの再作成
+
+§10.-6 の状態をまっさらな環境（リポジトリを clone し、`Resource/` だけ手で配置）
+から再現しようとして当たったもの。
+
+#### (a) ウォームリセット後に init が `[KSTACK]` で必ず死ぬ（カーネル、修正済み）
+
+```
+[OS] [KSTACK] kernel stack overflow pid=0x0000000000000001 name=Userland.ELF base=0x0000000003945A10
+```
+
+電源投入直後の起動では出ず、**同じ QEMU プロセス内でリセットした 2 回目の
+起動**で毎回、同じアドレスで出る。Chromium 実行中の無音リセットの後に
+これが続くので、「Chromium を動かすとマシンが二度と上がらない」ように見えた。
+
+原因: `process_manager_init()` はプロセステーブルを `malloc()` で取るが、
+カーネルヒープは確保領域をゼロにしない。`reset_process_slot()` は
+`kernel_stack_base` を**意図的に**消さない（§10.-2 で「スタックはスロットの
+持ち物」にしたため）。電源投入時はたまたまメモリがゼロなので全スロットが
+スタックを新規確保するが、ウォームリセットでは RAM に**前回ブートの
+テーブル**が残っており、ヒープ配置も決定的なので、もっともらしい
+`kernel_stack_base` が見えて確保が飛ばされ、今回のブートで別用途に渡した
+メモリの上で init が走っていた。
+
+修正 (`Core/process/ProcessManager_Create.c`): 確保直後に
+`memset(g_processes, 0, ...)`。
+
+再現手順（Chromium 不要）: 起動 → デスクトップ到達 → QEMU モニタで
+`system_reset` → 2 回目の起動。修正前は毎回 `[KSTACK]`、修正後はデスクトップまで
+上がる。実機でも電源投入時の RAM がゼロである保証はないので、同じ穴だった。
+
+#### (b) ランチャーがリポジトリに存在しなかった
+
+`Userland/.gitignore` が `/Application/Chromium` を**ディレクトリごと**除外して
+いたため、§10.-6 までのランチャー（`Start.c` / `Makefile`）は一度もコミットされて
+いなかった。`Userland/Application/Chromium/{Start.c,Makefile}` を Doom と同じ
+`XSession` 経路で書き直し、除外を `Resource/`（Chromium 本体、~500 MB）に限定した。
+
+#### (c) `--use-gl=swiftshader` は Chromium 155 では無効
+
+最初に書いたランチャーは `--use-gl=swiftshader --use-angle=swiftshader` を渡して
+おり、約 50 秒後にインプロセス GPU スレッドが死んでいた:
+
+```
+ERROR:ui/gl/init/gl_factory.cc:110] Requested GL implementation (gl=none,angle=none) not found in allowed implementations: [(gl=egl-angle,angle=default)].
+FATAL:ui/gl/init/gl_factory_ozone.cc:62] NOTREACHED hit. Expected Mock or Stub, actual:0
+[OS] [#GP] user-mode #GP -> terminating ... name=Chrome_InProcGp
+```
+
+（FATAL の文字列は `#GP` ダンプのユーザスタック上に ASCII で残っていた。）
+§2 の方針どおり `--disable-gpu` にすると GL 実装を要求しなくなり、描画は
+ソフトウェア合成になる。この組み合わせのとき、§10.-6 に書いた無音リセットも
+3 ブート中 2 回起きていたが、`--disable-gpu` 後の計測では起きていない
+（まだ 1 回のみ、結論は出していない）。
+
+#### 到達点（KVM, `-smp 4`, `-m 4096`）
+
+電源投入 → デスクトップ → Chromium 起動、90 秒時点でタブストリップ・
+オムニボックス・ツールバー・about:blank まで描画済み、6 分間リセット・
+パニック・プロセス終了なし。
+
+#### 残っている既知の問題
+
+- 「Something went wrong when opening your profile」ダイアログが出る。
+  `--user-data-dir=/tmp/chrome-profile` 配下で LevelDB がディレクトリを開けない
+  （`GCM Store: Unable to open directory`）。§10.-6 の「プロファイルエラー 0 件」は
+  再現していない。
+- Chromium が終了するとランチャーは `xsession_close()` で Xorg を kill するが、
+  `SYSCALL_TKILL` はシグナルを積むだけで、Xorg は数分経っても終了しない。
+  ミラーは先に外れるので、Xorg が 1024x680 の黒い画面をパネルに直接描き続ける。
+- TCG（KVM なし）では 18 分待っても描画に至らなかった。計測には KVM が要る。
+
+#### 環境構築で要ったもの（ドキュメント外）
+
+- `genisoimage`（xorriso は UDF を作れない）。root がなければ
+  `apt-get download genisoimage` を展開して `ISO_MASTER=` で渡せる。
+- `Vendor/Library/zlib/zconf.h`（`zconf.h.in` をコピー）。
+- `OVMF_CODE_4M.fd` をリポジトリ直下に（`/usr/share/OVMF/` からリンク）。
+
 ### 10.-6 追記 (2026-09-13) — **Chromium がブラウザ UI を描画し、動き続けるようになった**
 
 タブストリップ・オムニボックス・ツールバー・about:blank のページ領域まで
