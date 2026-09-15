@@ -427,6 +427,98 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 `base::sequence_manager` 内の NULL デリファレンス）。**症状が非決定的で
 CPU 数に依存する**ので、機能不足ではなくカーネルの SMP レースである。
 
+### 10.-10 追記 (2026-09-14, 夜) — 時刻・プロファイル・入力・「空白ウィンドウのハング」
+
+#### (a) ゲストと Chromium の時刻がずれていた（修正済み）
+
+- `clock_gettime(CLOCK_REALTIME)` / `gettimeofday` / `time` が呼ぶたびに RTC を読んでおり、
+  CMOS の更新中に読むと秒が飛ぶうえ、秒未満が常に 0 だった。
+- `clock_realtime_ns()`（Syscall_Clock.c）を追加: 起動時に RTC を 1 回（2 回一致するまで）
+  読んで基準にし、以後は `timer_monotonic_ns()` で進める。RTC アクセスは spinlock で保護。
+- Linux 側の `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` のタイムアウトが timespec ポインタの値そのもの
+  （≒20 分）として扱われていた。相対／絶対（CLOCK_REALTIME フラグ含む）を正しく変換し、
+  期限切れは値を確認してから `ETIMEDOUT`/`EAGAIN` を返すようにした。
+
+#### (b) 「プロファイルを読み込めませんでした」ダイアログ（修正済み）
+
+- 共有メモリ／プロファイル DB 周りで fd が尽きていた（`EMFILE`）。fd テーブルを 512 に拡張。
+  ただし 192..255 は AF_UNIX ソケットの番号帯なので、ファイル表はそこを飛ばす（下の (d)）。
+- tmpfs で「開いたまま unlink」されたファイルが即座に消えていた（Chromium の共有メモリは
+  /dev/shm に作って即 unlink する）。最後の close まで実体を残すようにした。
+- `MAP_FIXED` の匿名／ファイル mmap が既存のページを外さずに上書きしていた。先に
+  `paging_unmap_range` する。TLB シュートダウン前にフレームを解放していた経路も、
+  シュートダウン後にまとめて解放するよう変更（PartitionAlloc のメタデータ破壊の一因）。
+- SQLite の「pwrite した内容を読み取り専用 mmap で読む」に対応するため、ファイル書き込みを
+  同じアドレス空間の MAP_SHARED 写像へ反映する write observer を追加。
+
+#### (c) マウス・キーボードを Chromium 内で使えるようにした
+
+- XSession がウィンドウの入力（キー・ポインタ）を購読し、新 syscall `SYSCALL_EVDEV_INJECT`
+  (275) で /dev/input/event0,1 に注入する。ポインタは EV_ABS（0..65535）で渡し、
+  xorg.conf で `IgnoreRelativeAxes`/`IgnoreAbsoluteAxes` を指定（タッチスクリーン扱いされない
+  ようにデバイスは REL_X/REL_Y も広告する）。
+- PS/2: マウスパケット内の 0xFA/0xFE（dx/dy = -6, -2）を ACK/RESEND と誤認して捨てていた。
+- USB HID（`make run_*` の既定: qemu-xhci + usb-kbd/usb-mouse）で入力が一切来なかった。
+  `usb_storage_init()` がストレージ不在時に `usb_core_init()` を再実行し、そのたびに
+  ルートポート表とアドレス割り当てを初期化していた。既に列挙済みのキーボード／マウスの
+  ポートがリセットされ、スロットを保持したままなので Address Device が "port already
+  assigned"（TRB_ERROR）で失敗し、以後ホットプラグ監視が約 1 秒ごとにポートリセットを
+  繰り返してデバイスの割り込み転送を潰していた。再実行時は未列挙のポートだけを再試行し、
+  失敗は 3 回で打ち切る（抜かれたらリセット）。切断時は xHCI スロットを解放する。
+- USB キーボードの修飾キー（Ctrl など）はレポートの byte 0 のビットとしてしか扱っておらず、
+  キーイベントとして出ていなかった。X からは Ctrl が押されていないので Ctrl+L が「l」になった。
+  ビットの変化を 0xE0..0xE7 のキー押下／解放として発行する。
+- /dev/input/event* への write（xf86-input-evdev の EV_LED 等）が EIO だった。受け付けて捨てる。
+
+#### (d) クリック直後に Chromium が終了していた（修正済み）
+
+- 症状: クリックした直後に "X connection error received" で終了。ログでは Chromium 自身の
+  スレッドが X 接続と ProcessSingleton の listen ソケット（fd 0xC2..0xC4）を close していた。
+- 原因: fd 192..255 を AF_UNIX に割り当てているのに、pipe / memfd（作成・SCM_RIGHTS 受信）/
+  timerfd / signalfd / ディレクトリ fd の割り当てループはその帯を飛ばしていなかった。
+  fd が 190 を超えると memfd などに 0xC2 が割り当てられ、Linux の `close()` は番号だけで
+  `unix_socket_close()` に振り分けるので、memfd を閉じると同じ番号のソケットが壊れた。
+- 修正: 全割り当てループで `fd_in_unix_hole()` を確認する。
+
+#### (e) 空白（白／黒）ウィンドウのまま止まるハング
+
+- 停止中の stall ダンプを 3 回分比べると、毎回 Chromium のメインスレッドを含む複数スレッドが
+  **同じアドレスの futex で FUTEX_WAIT したまま**（同じユーザ RIP）で、他は epoll/ppoll を
+  回っているだけだった。ロック解放時の FUTEX_WAKE が失われている。
+- 原因: `process_block_current()` はタスクを BLOCKED にするだけで、実際の睡眠は syscall の
+  出口で起きる。待機キューのエントリを消すのは FUTEX_WAKE（requeue）かタイムアウトだけだが、
+  BLOCKED のタスクを起こす経路は他にもある（poll-wait の登録ビットが残ったままの notify、
+  走行中に積まれた wake credit など）。その場合タスクはエントリを残したままユーザ空間に戻り、
+  glibc が再び FUTEX_WAIT して 2 個目のエントリを積む。後の FUTEX_WAKE(1) が古い方に当たると、
+  寝ていないタスクを「起こし」、本当に寝ているタスクは永久に起きない。
+  poll-wait の起床はスレッドグループ ID 宛てだった（= メインスレッドのスロット）ので、
+  メインスレッドが毎回巻き込まれていたのと合う。
+- 修正:
+  - Linux の FUTEX_WAIT は必ず syscall を再実行（restart）させ、再入時にエントリがまだ
+    キューにあれば再び寝る。エントリが消えていれば 0（タイマーが消したなら ETIMEDOUT）を返す
+    （`syscall_futex_linux_resume()`）。ネイティブ ABI の経路は変更なし。
+  - Poll_Wait の登録・起床をスレッド ID 単位に変更（`process_sleep_current_ms()` と
+    `process_wake_pid()` はスロット単位で動くため）。
+- 結果（KVM `-smp 4`, `-m 4096`, 起動ごとに Chromium の UI が 20〜30 秒安定するまで観測）:
+  - 修正前（Poll_Wait をスレッド単位にした版／しない版の A/B を含む計 9 回）: 空白のまま
+    タイムアウト 5 回（A/B 6 回中 3 回、別計測 1 回中 1 回、診断ビルド 2 回中 1 回）。
+  - futex 修正後: 6 回連続で UI 表示・安定、空白期間は 2.1〜4.3 秒。USB 入力テスト（クリック、
+    文字入力、Ctrl+L、新しいタブ）も通過。
+
+#### (f) Chromium 終了後にデスクトップへ黒い矩形が残る（修正済み）
+
+- ミラー解除後も Xorg はクライアント切断でサーバ再生成してフリップを続け、KMS はミラーが
+  無いと実フレームバッファへ blit していた。一度ミラーを持ったセッションが解除した後は、
+  新しいミラー登録か DRM クローズまでフリップを捨てる（`g_mirror_released`）。
+
+#### 残っている問題
+
+- USB mouse（相対座標）は QEMU 側の加速の影響で位置が合わない場合がある（ハーネスは相対移動で
+  操作している。実機のタブレット／絶対座標デバイスは未対応）。
+- CJK フォントが無いので日本語のサジェストが豆腐になる。
+- tmpfs ファイルの MAP_SHARED を共有ページで実装する経路（`LINUX_TMPFS_SHARED_MMAP`）は
+  起動時にデッドロックしたため無効のまま。
+
 ### 10.-9 追記 (2026-09-14, 夕) — Chromium の起動を約 5 倍に高速化（ウィンドウ→UI 中央値 90.6 秒 → 17.2 秒）
 
 #### 効かなかったもの（A/B で確認して取り下げ）
@@ -480,6 +572,7 @@ TLB ポーリング）、`timer_monotonic_ns()`（HPET の MMIO）がスケジ�
 - 空白ページ・黒いウィンドウのまま止まるハング: この日の旧カーネルでは 7 回中 4 回と多かった
   （9 月 13 日の 25 回連続では 1 回）。停止中は全 CPU がカーネル内で spinlock を回っており、
   デッドロックの可能性がある。TSC 化の後は 6 回中 0 回だが、原因の特定・修正はまだ。
+  → 10.-10 (e) で原因（FUTEX_WAKE の取りこぼし）を特定し修正した。
 - プロファイル中、QEMU プロセスが UI 表示後に理由不明で終了した（1 回）。ハーネスが
   終了コードを記録するようにしたので、次に起きたらシグナルか正常終了か分かる。
 - PartitionAlloc の free 中の user-mode #GP（上記）。ヒープ破壊の出所（カーネルの
