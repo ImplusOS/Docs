@@ -1776,3 +1776,165 @@ libgbm の preload が消えて Xorg が
   tee を入れるうえに WM とフォーカスを取り合わないゲートが要る
 - Doom は 320x200 で描画し、ウィンドウ (1024x640) 側でスケールしないので
   左上に小さく出る
+
+---
+
+## M25. インストール済みディスク (FAT32) から起動すると X がモジュールを 1 つも見つけられない
+
+LiveCD (ISO9660/UDF) では再現せず、**インストール済みディスクから起動したときだけ**
+Xorg が振り出しに戻る:
+
+```
+(II) LoadModule: "glx"
+(WW) Warning, couldn't open module glx
+(EE) Failed to load module "glx" (module does not exist, 0)
+(II) LoadModule: "modesetting"   ... (module does not exist, 0)
+(II) LoadModule: "evdev"         ... (module does not exist, 0)
+(EE) No drivers available.
+Fatal server error: ... Server terminated with error (1)
+```
+
+X が死ぬので、そのあと spawn される Chromium は
+`[usock] connect FAILED '/tmp/.X11-unix/X0'` で接続先を失い、
+**「Chromium が起動しない」という形で見える**。Chromium 側には何も問題がない。
+
+### 真因: `cluster_to_lba()` がパーティション先頭 LBA を含まない値を返していた
+
+`Kernel/Drivers/FileSystem/FAT32/FAT32_Main.c` の `cluster_to_lba()` は
+**ボリューム相対**のセクタ番号を返し、パーティション先頭を足すのは各呼び出し側の
+責任だった。10 箇所は `g_fat32_partition_lba + cluster_to_lba(...)` と書いていたが、
+**3 箇所が足し忘れていた**:
+
+| 箇所 | 影響 |
+|---|---|
+| `_fat32_readdir()` | ディレクトリの実体より `g_fat32_partition_lba` セクタ手前を読む。そこは大抵ゼロなので先頭エントリで `first == 0x00` = 終端と判定し、**あらゆるディレクトリが空に見える** |
+| `_fat32_list_root_files()` | 同上（デバッグ出力のみ） |
+| `_fat32_mkdir()` | `.` / `..` エントリを**ボリュームの手前に書き込む**（データ破壊） |
+
+`g_fat32_partition_lba` が 0 になる構成（ISO9660/UDF が root を持つ LiveCD、
+パーティションテーブル無しの生 FAT32 イメージ）では差が出ないので、
+インストール済みディスクでしか出なかった。
+
+X 側がこれを踏むのは `FindModuleInSubdir()` が `opendir`/`readdir` 駆動だから
+（M5 と同じ経路、あのときは `fstat` が原因）。readdir が常に空を返せば
+`modules/{drivers,extensions,input}` は走査されず、結論は「モジュールが無い」になる。
+同じ理由で `/usr/lib/xorg/protocol.txt` も開けていない。
+
+**対処**: `cluster_to_lba()` 自身が `g_fat32_partition_lba` を含む**絶対 LBA** を
+返すようにし、10 箇所の手動加算を削除。エラー値は 0 のまま（FAT32 ボリュームの
+最初のデータセクタが絶対 LBA 0 になることはない）。足し忘れが再発しない形にした。
+
+## M26. UGREEN AX900 を挿すとカーネル初期化が `[AX900] ... attached` で止まる
+
+```
+[AX900] UGREEN AX900 (AIC8800D80) attached
+（以後なにも出ない）
+```
+
+### 真因: 境界の無い USB バルク転送を、ブートフェーズとポーリング経路から叩いていた
+
+- `xhci_submit_bulk()` の既定タイムアウトは **`XHCI_BULK_TIMEOUT_MS` = 30 秒**。
+  マスストレージのコマンドには妥当だが、「何か来ているか」を訊くだけのポーリングには
+  致命的で、**NAK を返し続けるデバイス相手では毎回まるまる 30 秒を使う**。
+  ファームウェア未ロードの AIC8800D80 はまさにそれ。
+- `ax900_probe()` はその上で `ax900_read_chip_id()` を呼んでいた。probe は
+  `driver_module_deferred` フェーズの中で走るので、**ブートがそこで止まって見える**。
+- 抜けたあとも `ax900_nic_init()` が `attached` だけで true を返すため AX900 が
+  active NIC になり、`ax900_poll()`（`Syscall_Dispatch.c` → `network_stack_poll()`
+  経由 = syscall 経路）が毎回 30 秒のバルク IN を張って系全体が停止する。
+- さらに `ax900_send_msg()` は `g_api->event.wait()` で応答を待っていたが、
+  その event を signal できるのは**同じスレッド上の** RX 処理だけなので、
+  **原理的に起こされることがなく**、毎回タイムアウト分を空費していた。
+
+### 対処
+
+| 変更 | 内容 |
+|---|---|
+| `XHCI.c` / `XHCI.h` | `xhci_submit_bulk_timeout()` を追加（本体を移し、`xhci_submit_bulk()` は既定値で呼ぶ薄いラッパに） |
+| `USB_Main.c` / `USB_Main.h` | `usb_submit_bulk_timeout()` を追加。xHCI のみ尊重（OHCI/UHCI/EHCI は元々数秒で諦める） |
+| `DriverBinary.h` | `usb_device_context_t` に `submit_bulk_timeout` を追加。**ポーリングするドライバはこちらを使うこと** |
+| `AX900.c` | 全転送を `AX900_USB_XFER_TIMEOUT_MS` (50ms) 上限に。`probe()` からデバイスアクセスを全廃。`send_msg()` は待つあいだ自分で IN を drain する（event 待ちを撤去）。bring-up ladder は `AX900_RETRY_INTERVAL_MS` (5s) 間隔・`AX900_MAX_BRINGUP_ATTEMPTS` (3回) で打ち切り。bring-up 前は IN を読まない |
+
+**残っている既知の穴（今回は未対応）**: `nic_init()`（`Drivers/Module/NIC.c`）は
+DeviceRegistry の先頭から `init()` が true を返した最初の 1 つを選び、二度と
+選び直さない。AX900 は `driver_module_deferred` で登録されるので内蔵 NIC より先に
+並び、`ax900_nic_init()` が `attached` で true を返す以上、**ドングルを挿すと
+有線 NIC が選ばれなくなる**。false を返させれば有線は生きるが、Wi-Fi 管理系
+(`nic_wifi_*`) も active NIC 経由なので Wi-Fi パネルが死ぬ。NIC 選択の再実行、
+または Wi-Fi 管理系を active NIC から切り離すのが本筋。
+
+## M27. 実機だけ Chromium が `ProcessSingleton` で落ちる — TmpFS のディレクトリハンドルが 8 個しかなかった
+
+M25 の FAT32 修正でモジュール探索は通るようになり(`Failed to load module` が消え、
+`LoadModule: "glx"` まで到達)、次の壁が出た:
+
+```
+FATAL:chrome/browser/process_singleton_posix.cc:1050]
+Check failed: base::GetPosixFilePermissions(socket_dir_.GetPath(), &dir_mode)
+              && dir_mode == base::FILE_PERMISSION_USER_MASK.
+Temp directory mode is not 700: 0
+[app] exit pid=7 status=132   (128+SIGILL = ImmediateCrash() の ud2)
+```
+
+### `0` はモードではなく「stat が失敗した」印
+
+Chromium 側:
+
+```c
+int dir_mode = 0;
+CHECK(base::GetPosixFilePermissions(dir, &dir_mode) && dir_mode == 0700)
+    << "Temp directory mode is not 700: " << ...;
+```
+
+`GetPosixFilePermissions()` は `stat()` が失敗すると **false を返し `dir_mode` を
+触らない**ので、出力の `0` は初期値そのもの。TmpFS が 0 を格納することはない
+(`TMPFS_MODE_DIR` = 0755、`mkdir` 直後に `linux_apply_create_mode()` が 0700 を
+書く)ので、**`mkdtemp()` が今作ったばかりのディレクトリの `stat()` が
+ENOENT を返した**、が唯一の説明。
+
+### 真因: 存在判定が `vfs_opendir()` で、TmpFS のハンドルが 8 個だった
+
+`linux_stat_path()` は「`find_file` で見つからない → `vfs_opendir()` が通れば
+ディレクトリ、通らなければ **ENOENT**」という判定をする。つまり
+**ハンドル枯渇が「そんなパスは無い」と報告される**。
+
+各 FS のプールを並べると TmpFS だけ桁違いに小さい:
+
+| FS | ディレクトリハンドル数 |
+|---|---|
+| ISO9660 | 256 |
+| FAT32 / exFAT | `FILE_MAX_DIR_HANDLE_CONFIG` (192) |
+| UDF | 32 |
+| **TmpFS** | **8** |
+
+fd 層自体は 192 本まで配るので、TmpFS だけが通常利用で先に尽きる。
+`/tmp` `/run` `/var` `/dev/shm` は全部このプールを共有し、しかも
+`--user-data-dir=/tmp/chrome-profile` でブラウザプロファイル丸ごとが
+TmpFS の上にある。X が数本掴んだまま Chromium が起動すれば 8 本は簡単に超える。
+
+QEMU で再現しないのは、あちらでは **Xorg が先に死んでいて** Chromium が
+/tmp を独占していたから(M25 修正前のログでは `[app] exit pid=6 status=1` が
+chrome spawn より前にある)。
+
+**対処**:
+
+- `TMPFS_DIR_HANDLE_MAX` を 8 → `FILE_MAX_DIR_HANDLE_CONFIG` に。
+  これで fd 層の上限だけが上限になり、FAT32/exFAT と揃う。
+- 枯渇したら `[tmpfs] all N directory handles in use, opendir failed for <path>`
+  を 1 回出す。出ないまま同じ症状が続くなら、この仮説は外れ。
+- `linux_stat_path()` と `linux_statx()` に分裂していた同じ処理を
+  `linux_fill_stat_for_path()` に統合。**statx 側はディレクトリのモードを
+  0755 固定で返していて `vfs_get_mode()` を見ていなかった**ので、
+  プログラムがどちらの syscall を使うかで見えるモードが変わっていた
+  (Chromium が statx を使えば「mode is not 700: 755」で同じく落ちる)。
+
+**未対応で残した既知の穴**:
+
+- `tmpfs_vfs_mkdir()` は**既存パスに対しても true を返す** = `mkdir(2)` が
+  EEXIST を返さない。今回の原因ではないが POSIX 的に誤り。
+- Chromium 終了後に `[mem] OOM at malloc request=0x120` が連続する。
+  `free_pages` は総数の 9 割が空いているので**カーネルヒープ側の枯渇**で、
+  `[proc] address space kept: threads still running on other CPUs` と併せて
+  プロセス回収の取りこぼしが疑われる。
+- クラッシュハンドラ内で `movaps %xmm0,-0x30(%rbp)` が #GP =
+  **ユーザスタックが 16 バイト境界に載っていない**。M24 の SSE 問題と同系統。

@@ -419,6 +419,230 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 
 ---
 
+## 11. 起動フラグの削減 — 「ほぼ通常の Linux 版 Chromium」へ (2026-09-17)
+
+ランチャ（`Userland/Application/Chromium/Start.c`）が渡していた回避用フラグを
+外していく作業。目標は「URL とウィンドウだけ」のコマンドライン。
+
+### 11.1 外せたフラグ（QEMU 実起動で確認済み）
+
+```
+--no-first-run --no-default-browser-check --disable-sync
+--disable-background-networking --disable-component-update
+--disable-breakpad --disable-crash-reporter --disable-crashpad-for-testing
+```
+
+これで Chromium は **初回起動フローを通常どおり実行**し（利用規約ダイアログが
+出る）、`chrome_crashpad_handler` を**別プロセスとして起動**し、Sync /
+variations / component updater のネットワークアクセスも普通に試みるようになった
+（GCM の登録要求が Google のサーバから実 HTTP 応答を受け取るところまで動く）。
+
+QEMU（KVM, `-smp 4`, `-m 4096`）で 420 秒連続起動し、FATAL・クラッシュ無しで
+example.com を表示したまま安定することを確認。残る警告バーは Chromium 自身の
+「You are using an unsupported command-line flag: --no-sandbox」だけで、これは
+下の 11.2 がそのまま出ている。
+
+外すために必要だったカーネル側の実装:
+
+| 症状 | 原因 | 修正 |
+|---|---|---|
+| `opendir /proc/self/fd` が ENOENT → `Check failed: client.StartHandler(...)` | ProcFS にディレクトリ列挙が無かった | `/proc`・`/proc/<pid>/{fd,fdinfo,task}` の opendir/readdir を実装。fd はファイル表・AF_UNIX・AF_INET の 3 つの番号帯をまとめて列挙する（`syscall_file_next_open_fd` / `unix_socket_next_open_fd` / `syscall_socket_next_open_fd`） |
+| crashpad ハンドラが exec されない | `clone(CLONE_VM\|CLONE_VFORK\|SIGCHLD, stack)`（vfork / glibc の posix_spawn）を**スレッド生成**として扱っていた。子側のコード（fd を閉じて execve）が呼び出し元プロセスの中で走り、呼び出し元の `_exit(EXIT_SUCCESS)` に巻き込まれて死んでいた | `CLONE_THREAD` が無いものはすべて**プロセス**として fork する。`stack` が指定されていれば子のユーザ RSP をそこに向ける（`process_set_forked_child_user_rsp`）。アドレス空間は共有ではなくコピーなので、posix_spawn が `args.err` 経由で exec 失敗を親に伝える経路だけは失われる（失敗は子の exit 127 として一段遅れて現れる） |
+| 最初の `sendmsg` が EPIPE → StartHandler 失敗 | AF_UNIX エンドポイントが fork をまたいで参照カウントされておらず、親が自分側を close すると子の側まで壊れていた | エンドポイントごとに**プロセス別の参照カウント**を持たせ、最後の 1 つが手放したときだけ破棄する。fork で子に引き継ぐ（`unix_socket_fork_inherit`） |
+| `missing credentials`（`util/linux/socket.cc:177`） | `SO_PASSCRED` / `SCM_CREDENTIALS` 未実装 | `SO_PASSCRED` を AF_UNIX の実状態として保持し、recvmsg が `SCM_CREDENTIALS`（送信元 pid, uid 0, gid 0）を付ける。`SO_PEERCRED` も相手側の実 pid を返すようにした |
+| ログが読めない | `serial_write_string()` に排他が無く、4 CPU が同時に書くと 1 行が文字単位で他の行と混ざる（`ERROR` を grep できないほど） | リング＋UART をスピンロックで囲む。ログファイル書き込みは VFS ロックと順序が競合するので外に出す。ユーザの write(2) は `serial_write_buffer()` で 1 回の呼び出しを 1 まとまりとして出す |
+| 起動 6 分後に `Check failed: epoll_.is_valid(). : Too many open files (24)` | 無効化フラグを外したぶんサブシステムが増え、`EPOLL_MAX_INSTANCES=16` を使い切った（epoll インスタンスはメッセージループを持つスレッドごとに 1 つ） | epoll 16→128 インスタンス / 64→192 エントリ、eventfd 32→128、AF_INET ソケット表 64→256（`SOCKET_FD_BASE`+size は 1024 未満を維持） |
+
+`fork()` がスレッドから呼ばれたときに、**呼び出し元スレッド**ではなく
+プロセス（メインスレッド）のレジスタフレームを子にコピーしていたバグも
+同時に修正した（Chromium のプロセス起動は専用スレッドで走る）。
+
+### 11.2 外せていないフラグと、その理由（→ §12 で解決済み）
+
+```
+--no-sandbox --disable-gpu --single-process --no-zygote
+```
+
+いずれも **1 つの構造的な不足**に行き着く。
+
+- **`--single-process --no-zygote`**: zygote 自体は起動して exec まで到達する
+  ようになった（`dup2(<AF_UNIX fd>, 3)` を可能にするため、ネイティブ番号帯の
+  外に置かれたソケット記述子の**別名**を実装した — `unix_socket_dup_to()`）。
+  次に当たったのが `Syscall_File.c` の**ファイル記述子表がプロセス別ではなく
+  グローバル**であること。Chromium は子プロセスごとに `/dev/null` を自分の
+  fd 0 に `dup2` するが、fd 0 は別プロセスのものなので EACCES になる
+  （`Failed to dup /dev/null for stdin` → 子は exit 127 → ブラウザは
+  `Did not receive ping from zygote child` で落ちる）。
+  **per-process fd テーブルへの作り替えが前提条件**で、これは Chromium 側の
+  問題ではなくカーネルの設計変更。
+- **`--no-sandbox`**: レイヤ 1 サンドボックスは zygote の中で張られるので、
+  上が済むまで実地で動かせない。カーネル側の材料は入れた:
+  `chroot(2)` は**実際にパス解決をリダイレクトする**（`process_set_current_root`
+  + `linux_apply_root`。Chromium は空ディレクトリに chroot したあと `/proc` が
+  消えたことを確認するので、素通しの chroot では意味が無い）、`capset`/`capget`
+  はプロセスごとの実状態、`unshare` と `/proc/<pid>/ns/*` は応答する、
+  `clone(CLONE_FS)` はルートを共有する。名前空間そのものは隔離ではない
+  （pid/network/mount は 1 つしか無い）ので、そこは正直に書いてある。
+  seccomp-bpf は**実装したふりをしない**（`seccomp(2)` は ENOSYS、
+  `PR_SET_SECCOMP` は従来どおり）。about:sandbox に無い機能を報告させないため。
+- **`--disable-gpu`**: GPU プロセスも別プロセスなので同様。実 GPU が無くても
+  Chromium は自力で SwiftShader（`libvk_swiftshader.so` がバイナリに同梱）へ
+  フォールバックするので、プロセスさえ起てば追加のフラグは要らない見込み。
+
+### 11.3 COW fork の状態
+
+multiprocess のために `KERNEL_COW_FORK` を有効化して見つかった実バグ 2 件を
+修正した（詳細は `kernel/config.h` のコメント）。
+
+1. `process_clone_address_space()` が `0x1000..USER_STACK_BASE` しか clone して
+   おらず、子にスタックも mmap アリーナも無かった。2026-08-29 に「COW にすると
+   起動が不安定」として撤回された原因はこれ。
+2. すでに 1 回目の fork で read-only に落としたページを、2 回目の fork が
+   `PAGE_COW` を付けずにただの read-only として共有していた。Xorg は xkbcomp を
+   2 回 fork するので、1 回目のキーマップは通り 2 回目が glibc の post-fork
+   コードで SIGSEGV していた。
+3. CR0.WP が 0 なのでカーネルは read-only のユーザページに素通しで書ける。
+   COW 共有中のページにカーネルが書くと親のメモリまで書き換わるため、
+   `paging_user_range_break_cow()` を用意して `copy_to_user()`・
+   書き込み可否判定・シグナルフレーム作成・AF_UNIX recv の直前で先に解除する。
+
+既定は **0 のまま**。multiprocess と組み合わせた起動で、zygote がデータとして
+再利用されたページテーブルを踏んで死ぬ事象が 1 件あり、原因が未特定のため。
+単プロセス構成では同じビルドで問題は出ていない。
+
+### 11.4 次の一手
+
+1. **per-process fd テーブル**（`Syscall_File.c`）。これが無いと multiprocess
+   Chromium は先に進まない。ソケット・AF_UNIX の別名表もそこへ統合できる。
+2. COW + multiprocess でのページテーブル破壊の特定。
+3. 上記 2 つが済んでから `--no-zygote` / `--single-process` → `--no-sandbox`
+   → `--disable-gpu` の順で外す。
+
+---
+
+## 12. 残り 4 フラグの削除 — 回避フラグなしでの起動 (2026-09-18)
+
+`--no-sandbox --disable-gpu --single-process --no-zygote` も外し、ランチャの
+コマンドラインは `--ozone-platform=x11`・ウィンドウ位置/サイズ・
+`--user-data-dir`・URL だけになった。KVM `-smp 4 -m 8192` の実起動で、
+名前空間サンドボックス（ユーザ/PID 名前空間・chroot・capability 削減）、
+GPU プロセス（SwiftShader へ自動フォールバック）、zygote からの
+renderer fork、初回起動フロー、Crashpad がすべて有効な状態で example.com を
+表示する。起動時の警告バーは Chromium 通常の「Continue where you left off」
+だけ（`--no-sandbox` 警告は出ない）。
+
+プロセス木は実機 Linux の Chromium と同じ形になる:
+ブラウザ → `CLONE_NEWUSER` の試験子 → 名前空間 zygote（pid 1 として動作、
+`clone(CLONE_VM|CLONE_VFORK|CLONE_FS|CLONE_SETTLS)` の chroot ヘルパ、
+init reaper 分離）→ `CLONE_NEWPID` で fork される renderer 群、
+ならびに非サンドボックス zygote → GPU / utility プロセス。
+
+### 12.1 プロセスごとのファイル記述子表（最大の変更）
+
+§11.2 の根本原因（fd 表がグローバル）を、**Linux ABI 層に per-process の
+番号表**を置く形で解決した（`Compat/Linux/Linux_FdTable.[ch]`）。各
+Linux プロセス（スレッドはメモリ所有者の表を共有）が自分の fd 番号 →
+カーネル大域番号の対応を持ち、`linux_syscall_dispatch()` の入口
+（`lx_fd_pre`）で引数を変換、出口（`lx_fd_post`）で新しい記述子に番号を
+割り当てる。バックエンド（Syscall_File / UnixSocket / Syscall_Socket /
+Syscall_Epoll）は大域番号のまま無変更。
+
+- `close/dup/dup2/dup3/F_DUPFD(_CLOEXEC)/F_GETFD/F_SETFD` は表だけで完結し、
+  バックエンドは「このプロセスで最後の番号が消えたとき」だけ close される。
+- close-on-exec は表側で管理し、`O_CLOEXEC` 系ビットはバックエンドに渡す前に
+  落とす（バックエンドが execve 時に勝手に閉じないように）。
+- fork で表をコピー、exit で解放（`process_register_lifecycle_hooks`）。
+- poll/select はユーザ空間の配列内の番号をその場で変換、`/proc/<pid>/fd` は
+  表を列挙（`procfs_set_fd_hooks`）、SCM_RIGHTS は送信時に大域番号へ、受信時に
+  受信側の番号へ（`unix_socket_set_fd_hooks`）。
+- AF_UNIX の大域番号帯は X の制約から解放されたので 768..1023 に移し、
+  エンドポイントを 256 個に増やした（受信リングはヒープ確保）。
+
+### 12.2 AF_UNIX
+
+- `SOCK_SEQPACKET`/`SOCK_DGRAM` のメッセージ境界を実装（zygote 通信は
+  SEQPACKET で 1 回の read に 1 要求を前提にしている）。記述子もそれを送った
+  メッセージに紐付く。
+- SCM_RIGHTS で memfd 以外（AF_UNIX ソケット、ファイル、パイプ）も渡せるように
+  した。受信前のソケットは `inflight` で生かしておく。
+- **受け渡した memfd のアクセスモードを保存する**。以前は常に O_RDWR で
+  作り直しており、読み取り専用で渡された pseudonymization salt 領域が
+  `PlatformSharedMemoryRegion::Take()` の `CheckFDAccessMode` で弾かれ、
+  すべての子プロセスが起動直後に CHECK 失敗していた（`O_RDONLY` が 0 なので
+  `syscall_memfd_install_shm()` の「0 なら RDWR」も併せて削除）。
+- 共有メモリは「memfd を持っている者が map できる」を正とした
+  （単一 pid の grant では zygote 経由で fork された子が map できなかった）。
+
+### 12.3 COW fork（既定で有効化）
+
+`KERNEL_COW_FORK=1`。§11.3 で未解明だった「multiprocess で zygote がページ
+テーブルの残骸を踏む」原因は、**マルチスレッドの親を fork 中に兄弟スレッドが
+動いていたこと**だった（COW clone は親のページテーブルをその場で書き換える
+ので、同時の munmap で解放されたテーブルに書き込み得る）。Linux が mmap_lock で
+保証していることを、fork 中は同じプロセスの他スレッドをスケジュールしない
+形（`process_fork_hold_acquire` / `fork_hold_tid`）で実装した。ほか:
+
+- `mprotect(PROT_READ)` 後も COW ビットが残り、カーネルが書き込み可として扱って
+  いた（Chromium の protected memory 自己検査が CHECK 失敗）。書き込み禁止に
+  するときは COW も落とし、書き込み許可するときに共有中なら COW を付ける。
+
+### 12.4 fork / exit まわりのカーネルのバグ
+
+- `clone()` に渡されたスタックを、子が READY になった**後**に設定していた。
+  SMP では子が先に走り、親のスタック上で動いて落ちる（chroot ヘルパが親の
+  フレームに「戻って」RBP=0 でフォールト）。`CLONE_NEWPID`・`CLONE_FS` の
+  反映も同様に fork 内（子が走る前）へ移した（`process_fork_ex`）。
+- スレッドが `exit_group()` を呼ぶと、先頭の `process_scheduler_release_stale_pid`
+  が**別 CPU で正当に実行中のリーダー**を current から外していた。その CPU は
+  プロセス無しでユーザ空間へ戻り、glibc の `_exit` 後の `hlt` で #GP。親が
+  まだ走っているプロセスを回収できてしまう問題もあった。リーダー自身の
+  exit のときだけ行うよう修正。回収（`wait4`）は全スレッドが CPU から
+  降りてから（`process_group_on_cpu_locked`）。group exit を冪等化。
+- 正常終了した renderer がこの #GP で「Aw, Snap! (error code 4)」になって
+  いたのはこれ。
+- `execve("/proc/self/exe")` を追う（network service はこれで再 exec する）。
+- epoll インスタンスに close が無く、生成のたびに漏れていた。参照数付きの
+  close と、close された記述子を所有プロセスの interest list から外す処理を追加。
+
+### 12.5 サンドボックス
+
+- **資格情報**: Chromium は root ではサンドボックスを起動しない
+  （"Running as root without --no-sandbox is not supported"）。プロセスごとの
+  uid/gid（`process_t.uid/gid`）を追加し、`getuid` 系・`set*id`・stat の所有者・
+  SCM_CREDENTIALS・/proc の Uid 行に反映。ネイティブ syscall
+  `SYSCALL_SET_CREDENTIALS`(276) でランチャが X サーバ起動後に uid/gid 1000
+  （`/etc/passwd` の `implus`）へ切り替えてから Chromium を起動する。
+  ファイル権限の強制は無い（stat は常に問い合わせた本人の所有として報告）。
+- **PID 名前空間**: `CLONE_NEWPID` で作られたプロセスは自分を pid 1 と見る
+  （`getpid/gettid/getppid`、kill/tgkill/wait4 の引数と戻り値、
+  /proc の stat/status、SCM_CREDENTIALS/SO_PEERCRED を名前空間越しに変換）。
+  zygote と各 renderer の `CHECK_EQ(1, getpid())` のためで、隔離ではない。
+- **chroot**: `/proc/self/...` への chroot は呼び出し元の pid に固定する。
+  Chromium はヘルパを `/proc/self/fdinfo/` に chroot させ、ヘルパが死ねば
+  そのディレクトリごと消える（= 何も見えない root）ことに依存している。
+  `fdinfo/` の中は数字だけ存在する。
+- `/proc/<pid>/task` の link 数（単一スレッド判定）、完全な `/proc/<pid>/status`、
+  `wait4` の `__WALL` 等、capability の fork 継承、`PR_CAP_AMBIENT`/`PR_CAPBSET_DROP`。
+- seccomp-bpf（レイヤ 2）は従来どおり「非対応」と報告する。
+
+### 12.6 GPU
+
+`--disable-gpu` を外すと GPU プロセスが起動し、実 GPU が無いので Chromium が
+自力で SwiftShader に落ちて合成する（`vkCreateInstance failed with
+VK_ERROR_INCOMPATIBLE_DRIVER` は最初の Vulkan 試行の警告で無害）。GPU 側に
+固有の修正は不要だった — 必要だったのは上記の multiprocess の基盤。
+
+### 12.7 残っていること
+
+- 名前空間は観測上の再現であって隔離ではない（pid / network / mount は 1 つ）。
+  seccomp-bpf は無い。サンドボックスが実際に守るのは「renderer から
+  ファイルシステムが見えない」「capability が無い」の 2 点。
+- ファイルの権限・所有者はどこでも強制されない。
+- fd 表は per-process だが、バックエンドの大域テーブルの容量（ファイル 512、
+  AF_UNIX 256、inet 256、epoll 128）は全プロセス共有のまま。
+
+---
+
 ## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
 
 `-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では
