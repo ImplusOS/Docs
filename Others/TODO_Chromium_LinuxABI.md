@@ -638,8 +638,148 @@ VK_ERROR_INCOMPATIBLE_DRIVER` は最初の Vulkan 試行の警告で無害）。
   seccomp-bpf は無い。サンドボックスが実際に守るのは「renderer から
   ファイルシステムが見えない」「capability が無い」の 2 点。
 - ファイルの権限・所有者はどこでも強制されない。
-- fd 表は per-process だが、バックエンドの大域テーブルの容量（ファイル 512、
-  AF_UNIX 256、inet 256、epoll 128）は全プロセス共有のまま。
+- fd 表は per-process だが、バックエンドの大域テーブルの容量（ファイル 512
+  → §13.5 で 2048、AF_UNIX 256、inet 256、epoll 128）は全プロセス共有のまま。
+
+## 13. マルチスレッド・GPU・音声・ダウンロード・安定性 (2026-09-19)
+
+目標は「YouTube の動画を音付きで再生できる」こと。KVM `-smp 4 -m 8192` で
+"Me at the zoo" が実時間で最後（19.02 秒）まで再生され、自動再生で次の動画へ
+進む。音声は ALSA 経由で HDA から出る。以下、原因ごとに記録する。
+
+### 13.1 マルチスレッド（確認のみ + スケジューラ）
+
+Web Worker 4 本の計算で `hardwareConcurrency=4`、スループットは 1 本の
+3.37 倍。Chromium 自体は最初から多スレッドで動いていたが、次を直した。
+
+- **ユーザモードのタイマ割り込みによるプリエンプション**
+  (`process_preempt_from_user_irq`)。従来は syscall でしか切り替わらず、
+  計算ループのスレッドが CPU を離さなかった。割り込まれた全レジスタを
+  syscall フレームに詰め、復帰は iret 経路（`full_restore`）で行う。
+  rseq の abort 処理はプロセスロックの外で copy_*_user を使う
+  （ロック内でユーザメモリに触るとページフォルトが同じロックを取り直して
+  固まった）。シグナルフレームの書き込みも同様に先にページを確定させる。
+- AP ごとのタイムスライス、アイドル CPU の `hlt` 待ちと起床 IPI
+  （`VECTOR_RESCHED 0xFD`）、`SCHED_FIFO/RR` の優先実行（音声スレッド用）。
+- CPU 例外をシグナルに変換（#DE/#MF/#XM→SIGFPE、#UD→SIGILL、#BP/#DB→SIGTRAP、
+  #AC/#SS→SIGBUS、他 SIGSEGV）。V8 は #UD/#BP を自分で処理する。
+  シグナルフレームに FXSAVE 領域を積み、`rt_sigreturn` で FPU 状態を戻す。
+- COW フォルトの競合（同じページに 2 スレッドが同時に書く）と、
+  コピー後の TLB シュートダウン漏れ。
+- futex: PI ロック（LOCK_PI/LOCK_PI2/TRYLOCK_PI）を再実行方式で実装し直し、
+  共有 futex（非 PRIVATE）を共有メモリ上のオフセットで鍵付けした。
+  glibc の "The futex facility returned an unexpected error code" は
+  これらが原因。
+
+### 13.2 GPU アクセラレーション
+
+`--ignore-gpu-blocklist` をランチャの既定フラグに加えた。`chrome://gpu` で
+Canvas / Compositing / Rasterization / WebGL / WebGPU / Video Decode が
+"Hardware accelerated" になる。ただし**実体は Mesa llvmpipe（CPU による
+GL 実装）上の ANGLE**である。QEMU の既定構成には GPU が無く、virtio-gpu
+（virgl）ドライバも未実装なので、真の GPU 加速ではない。
+
+### 13.3 音声
+
+ALSA のカーネル ABI を新設した（`Core/sound/ALSA.[ch]`、
+`/dev/snd/controlC0`・`/dev/snd/pcmC0D0p`）。Chromium は PulseAudio が
+無いと ALSA の "default" を開くので、`/usr/share/alsa/alsa.conf` を最小構成で
+配置する（`Vendor/LinuxRuntime/stage-alsa.sh`）。
+
+- hw_params の区間絞り込み、WRITEI / SYNC_PTR / DRAIN / PAUSE / REWIND 等。
+  U8/S16/S32/FLOAT を 48 kHz S16 ステレオへ変換（線形補間）。
+- HDA ドライバを巡回 DMA リング（16×2 KiB、LPIB で位置を追跡）に書き換え、
+  `driver_audio_t.stream_*` で連続再生する。再生済み領域は無音で埋める。
+- **複数サブストリームのミキシング（8 本）**。Chromium はページごとに
+  出力ストリームを開き、前のページのストリームを閉じる前に次を開くことがある。
+  単一サブストリームだと 2 本目の open が EBUSY になり、Chromium は無音の
+  フェイク出力へ落ちていた（ナビゲーション後に音が出ない）。
+- **デバイス側の先行量を 40 ms → 80 ms**。QEMU の HDA コーデックは
+  リングから最大 8 KiB（約 43 ms）を先読みするので、40 ms では毎周
+  書き込み位置を追い越して「10 ms 鳴って 20 ms 無音」を繰り返していた。
+- **バッファ下限 160 ms**。Chromium は約 85 ms を要求するが、それでは
+  音声スレッドの余裕が 60 ms を切り、ページが忙しいと毎分数十回
+  アンダーランしていた（1 本の動画で xrun 約 70 回 → 0〜1 回）。
+- Chromium の renderer → audio service の経路で必要だったもの:
+  AF_UNIX の `FIONREAD`（`SyncSocket::Peek` が失敗すると常に無音）、
+  tmpfs 共有 mmap、有限タイムアウトの poll を期限まで待つこと、
+  ブロッキング読み出しを `poll_wait_park` で待つこと。
+
+### 13.4 ダウンロード
+
+- 保存先は `/tmp/Downloads`（Chromium の既定。`$HOME` は `/tmp`）。
+  ファイルマネージャに「Home」「Downloads」を追加した。
+- 「開く」「フォルダを表示」はネイティブの `xdg-open`
+  （`Userland/Application/XdgOpen`、`/usr/bin/xdg-open` に配置）が処理する。
+  テキストはエディタ、ディレクトリとその他はファイルマネージャで開く。
+- クラッシュの原因は 3 つ。(1) `execve` が ENOENT でもプロセスを殺していた
+  （PATH 探索が最初の候補で終わる）→ 戻れない地点の前に存在確認。
+  (2) ネイティブ ELF に argv が渡っていなかった → `launch_argument` に連結。
+  (3) カーネルヒープ（128 MiB 上限）の枯渇 → 空きの 1/8、上限 1 GiB。
+
+### 13.5 「エラー 4」とクラッシュ・不安定さ
+
+- 「Aw, Snap! (error code 4)」は SIGILL（= #GP を 4 番で殺していた）。
+  #GP を SIGSEGV として配送し、殺すときも 11 番にした（§13.1 の例外変換）。
+- **pread/pwrite が seek+read+seek だった**。同じ fd を共有するスレッド同士で
+  オフセットを奪い合い、別の位置を読み書きし得た（Chromium のディスク
+  キャッシュや parkable image の退避ファイルが該当する。renderer が
+  `ImageFrameGenerator::GetYUVAInfo` で `ImageDecoder::Create` の null を
+  参照して落ちた事例 — 画像データが壊れていれば起きる — の原因候補だが、
+  再現頻度が低く、因果は確認できていない）。
+  位置を指定する `syscall_file_pread/pwrite` を追加し、オープンファイルごとの
+  ロックでオフセット・読み取りキャッシュ・拡張を直列化した。同じ
+  seek+read+seek だった `mmap` の即時読み込みと `sendfile`（オフセット指定）も
+  位置指定読み出しにした。
+- **プロセス表とファイル表のロック順の逆転（全 CPU が割り込み禁止で停止）**。
+  `process_execve` はプロセス表のロックを持ったまま close-on-exec の記述子を
+  閉じる（→ ファイル表のロック）。一方ファイル表のロックを持つ経路
+  （memfd 作成、fd 割り当て）は `process_get_current_pid()` を呼び、これが
+  プロセス表のロックを取っていた。fd 表の拡張で割り当てループがこれを
+  数百回呼ぶようになり、ブラウズ中に確実に固まった。`process_get_current_pid`
+  と `process_get_current_abi_mode` は実行中タスク自身のスロットしか読まない
+  ので、ロックを取らない実装にした（ほぼ全 syscall で呼ばれるので競合も減る）。
+- **TCP の接続スロット再利用**。RST 受信や再送打ち切りでスロットを即解放して
+  いたため、ソケットがまだ持っている接続 ID を次の `tcp_connect` が別の接続に
+  割り当て、2 つのソケットが 1 本のバイト列を共有していた。TLS が
+  `ERR_SSL_PROTOCOL_ERROR` で失敗し、YouTube の JS が読み込めず骨組みだけの
+  ページになる。ソケットが閉じるまでスロットを CLOSED のまま保持する
+  （`tcp_connection_t.user_ref`）。
+- TCP: 送信バッファが解放されず 16 KiB で止まる、ウィンドウ更新 ACK が無い、
+  順序外セグメントに重複 ACK を返さない、listen ソケットが POLLIN を返さない、
+  `SO_REUSEADDR` の誤マッピング（DevTools が起動しない）。
+- **ファイル記述子表 512 の枯渇**。renderer・GPU・network・audio の各
+  プロセスがリソースパックや ICU データを個別に開くので、YouTube 1 タブで
+  約 490 に達し、共有メモリの作成が EMFILE で失敗していた。大域表を
+  2048 にし、ソケット帯（512..1023）を穴として飛ばす。1024 以上は
+  Linux ABI プロセス（番号が per-process に変換される）にだけ割り当てる
+  （ネイティブの POSIX 層は大域番号で 1024 要素の表を引くため）。
+  枯渇時は所有者別の内訳を 1 度だけシリアルに出す。
+- **ページフォルトの取りこぼし**。別スレッドが同じページを要求時割り当てで
+  マップし終えるのと、このスレッドのフォルト処理が「まだ無い」と判定するのが
+  すれ違うと、demand-zero ハンドラは「もうある」と見て何もせず、処理不能と
+  してプロセスを殺していた（ダンプでは PTE が P=1 RW=1 U=1 なのに書き込み
+  フォルトで終了）。ハンドラの後でもう一度「今のテーブルなら許される
+  アクセスか」を確かめ、許されるなら TLB を捨てて再実行する。
+- **タスク数上限 256**。スレッドも 1 枠を使うので、数タブと GPU/network/
+  audio/storage プロセスで超え、`pthread_create` が失敗して新しいプロセスが
+  `CHECK(io_thread_->StartWithOptions())` で落ちていた。512（上限 1024）へ。
+- PCI の再走査がブリッジだけを辿り、既知デバイスの BAR を測り直さない
+  ようにした。UDP のバインド数・キュー段数の拡大。
+
+### 13.6 残っていること
+
+- GPU は llvmpipe（§13.2）。virtio-gpu / virgl は未実装。
+- この開発環境（WSL2 上の入れ子 KVM）では、Chromium の負荷中に
+  **VM 全体が約 300 ms 止まる**現象が 1〜2 秒おきに起きる。全 vCPU の
+  タイマ割り込みが同時に途切れ（`Timer.c` の `TIMER_GAP_TRACE=1` で観測）、
+  vCPU 数を減らしても変わらず、ホスト側のプロセスは止まらない。
+  Chromium を起動しないと起きない。この間は音声リングが更新されないので、
+  QEMU の WAV 出力には直前の音の繰り返しと無音が入る。ゲスト内の原因は
+  見つかっていない（WBINVD・PCI 再走査・ホットプラグ・LAPIC 再設定は
+  いずれもシロ）。
+- CDP のページセッションがときどき応答しなくなる（テスト用の観測のみ）。
+- 音声の入力（キャプチャ）は無い。
 
 ---
 
