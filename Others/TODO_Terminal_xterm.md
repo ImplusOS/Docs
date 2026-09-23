@@ -1,6 +1,8 @@
 # ImplusOS — 端末プラン（無改変 xterm + カーネル擬似端末）
 
-> **ステータス: 2026-09-05。T1〜T5 完了・QEMU 実機で検証済み。**
+> **ステータス: 2026-09-20。T1〜T5 完了・QEMU 実機で検証済み。**
+> 9/20 に 2 件のカーネル退行（COW と シグナル配送）を修正: §10。
+> 窓が黒いままになる残件（xterm のハンドシェイク用パイプ）は §10-3。
 > ImplusOS のデスクトップ上のウィンドウで、Debian trixie の無改変 `xterm` が
 > 同梱の静的 BusyBox（`/bin/sh`）を走らせ、`ash` のプロンプトが表示され、
 > 行編集のカーソル位置照会（`ESC[6n` → `ESC[1;12R`）まで往復している。
@@ -265,6 +267,7 @@ erase / `^C` / raw の各モードはホストのハーネスで押さえてあ�
   トレース（`[pty]` / `[fd]`、いずれも出力数に上限あり）は残してある。
   `OS_CONFIG_FOREIGN_TRACE=0` で消える。
 - pty ペアは 8 組固定（`PTY_MAX_COUNT`）。1 端末 1 組なので当面足りる。
+- **xterm の pty ハンドシェイク用パイプが壊れる**（§10-3。窓は開くが黒いまま）。
 
 ---
 
@@ -277,3 +280,111 @@ erase / `^C` / raw の各モードはホストのハーネスで押さえてあ�
 - X セッション: `Userland/API/Source/XSession.c`
 - ランチャ: `Userland/Application/Terminal/Start.c`
 - 同梱: `Vendor/LinuxRuntime/stage-xterm.sh`, `packages.seed.txt`
+
+---
+
+## 10. 2026-09-20 — Terminal が起動しない（xterm と /bin/sh が RIP=0 で SIGSEGV）
+
+`AUTOSTART=/Userland/Terminal/Terminal.ELF` でマスタリングした LiveCD を
+QEMU（q35 相当 / OVMF / 4 vCPU / KVM / `-display none`）で起動して再現させた。
+症状は 2 つのカーネル不具合が重なったもので、どちらも 9/05 の T1〜T5 以降に
+入った変更（COW fork の常用化・ユーザモードのタイマプリエンプション）による。
+
+### 10-1. COW の解除が「外来イメージの低位アドレス」で拒否されていた
+
+`/bin/sh`（静的 busybox・非 PIE・0x400000 台）が fork 直後の最初の自分の
+`.data` 書き込みで必ず落ちていた。
+
+```
+[OS] [PF] CR2: 0x0000000000713230   Error: 0x7 (present + write + user)
+[OS] [PF] pte=0x...825 P=1 RW=0 U=1 COW=1     ← 解除すべき COW ページ
+[PFDBG] pid=8 name=sh ... [app] exit pid=8 status=139 lived=85ms
+```
+
+`process_clone_address_space()` は Linux ABI プロセスを
+`[0x1000, USER_STACK_TOP)` 全域で COW 共有する（`process_user_buffer_is_valid()`
+も同じ窓を有効と見なす）のに、`Paging_Main.c` の
+`is_user_virtual_address()` はネイティブ配置の 4 窓（code/heap/stack/mmap）しか
+知らず、`paging_handle_cow_fault()` と `paging_user_range_break_cow()` が
+0x400000 を「ユーザアドレスではない」として門前払いしていた。結果、書き込みは
+COW 解除されずに SIGSEGV。
+
+**修正**: `is_user_cow_address()` を追加し、COW の 2 経路だけが
+`USER_FOREIGN_BASE`（= 0x1000、新設。ローダのポリシー・fork・usercopy が共有）
+から `USER_CODE_BASE` までの低位窓も受け付けるようにした。
+`is_user_virtual_address()` 自体は広げていない: カーネルは同じアドレス範囲に
+物理メモリを恒等マップしているので、低位アドレスは「値だけでは」ユーザ領域と
+判定できない。COW 経路は葉 PTE の `PAGE_USER` と `PAGE_COW` を必ず確認し、
+`resolve_fault_leaf_entry()` が非ユーザの walk を弾くので、この 2 経路に限れば
+安全に広げられる。
+
+- `Kernel/Source/Arch/x86_64/mmu/Paging_Main.c`
+- `Kernel/Source/Core/process/ProcessManager.h`（`USER_FOREIGN_BASE`）
+- `Kernel/Source/Core/process/ProcessManager_Create.c`（0x1000 直書きを置換）
+
+### 10-2. シグナル配送でハンドラの RSP が捨てられていた（これが「RIP=0」）
+
+`/bin/sh` が生き残るようになると、次は SIGCHLD を受けた側が
+**data ページへの命令フェッチ**（`Error: 0x15`、PTE は NX）で死ぬようになった。
+4 vCPU で 6 回起動して 2 回。落ち方は毎回同じ形:
+
+```
+[sig] push pid=8 sig=17 handler=0x453746
+[sigframe] newrip=0x453746 newrsp=0x47FFFFEE88 oldrip=0x4CEAA1 oldrsp=0x47FFFFF340
+[OS] [PF] RIP=0x712C48 UserRSP=0x47FFFFF348(=oldrsp+8) RBP=0x47FFFFF340(=oldrsp)
+```
+
+ハンドラは **中断時のスタックのまま** 開始し、最初の `ret` が `[oldrsp]` の
+値（データポインタ、あるいは 0）を拾って飛んでいた。RIP=0 はこの「0 を拾った」
+場合。
+
+原因は `Syscall_Dispatch.c` の syscall 出口:
+
+```c
+uint64_t next_saved_rsp = process_schedule_on_syscall(saved_rsp, current_user_rsp, ...);
+if (!request_switch && current_pid_get() == scheduled_from_pid) {
+    next_saved_rsp = saved_rsp;
+    next_user_rsp  = current_user_rsp;   /* ← シグナルが動かした RSP を捨てる */
+}
+syscall_set_user_rsp(next_user_rsp);
+```
+
+`process_schedule_on_syscall()` は切り替えないパスでも保留シグナルを配送する
+（`process_deliver_pending_signals_locked(current)`）。配送は
+フレームの RIP スロットと `saved_user_rsp` を **対で** 書き換えるのに、
+この行が RSP 側だけ syscall 入口の値に戻していた。RIP はハンドラ、RSP は
+中断時のもの、という不整合な状態でユーザモードへ戻っていたことになる。
+
+**修正**: 同じタスク・切り替えなしの場合でもスケジューラが返した user RSP を
+そのまま使う（0 のときだけ入口の値にフォールバック）。
+`Kernel/Source/Core/syscall/Syscall_Dispatch.c`。
+
+シェルが `cat /dev/applog &` を刈り取る SIGCHLD がこれを踏んでいたので、
+`/bin/imsession` 経由の Terminal では高確率で発症していた。
+修正後は 4 vCPU で 11 回起動して SIGSEGV 0 件。
+
+### 10-3. 残件: xterm の pty ハンドシェイク用パイプで子が SIGPIPE
+
+上記 2 件を直すと xterm も `/bin/sh` も落ちなくなり、ash のプロンプトが pty に
+出て、xterm がそれを読み `ESC[1;12R` を返し、画面に `/usr/bin # ` が描画される
+（§7 の 9/05 と同じ状態）。ただし **起動のたびに成否が変わる**。失敗時は:
+
+```
+[sigpipe] pipe-write pid=8 fd=13 writers=1      ← 子が書いたパイプに reader が 0
+[sigpush] pid=8 sig=13 (SIGPIPE, ハンドラ無し → 終了)
+[chldpost] child=8 childstate=ZOMBIE parent=7   ← xterm へ SIGCHLD
+[pipeclose] reader fd=12 left=0 by=7 owner=7    ← 直前に xterm 自身が read 端を close
+```
+
+以後 xterm は `wait4(-1, WNOHANG)` だけを毎秒 40 回ほど呼び続け（`reapchild`
+相当）、本来のイベントループに戻らない。そのため pty に出たプロンプトは誰も
+読まず、窓は黒いまま（xterm は生きているのでクラッシュログには何も出ない）。
+pty のハングアップ判定（`slave_ever_opened && !slave_open`）は無関係で、
+`[ptyhup]` は 1 度も出ない。
+
+つまり xterm の `OPT_PTY_HANDSHAKE` 用パイプで、子が書く前に read 端の
+参照が 0 になっている。fork のディスクリプタ継承は
+`syscall_file_fork_inherit()` の追加所有者ビットマップで扱われ、パイプの
+`reader_count` は open file description 単位なので、**Linux ABI の
+per-process fd テーブル（`Compat/Linux/Linux_FdTable.c`、9/20 導入）と
+グローバル fd の所有者ビットマップの間のずれ**が最有力。未調査。

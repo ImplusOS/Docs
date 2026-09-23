@@ -364,3 +364,26 @@ GSList *(*get_formats)(void) = dlsym(h, "gdk_pixbuf_get_formats");
 - ランチャ雛形: `Userland/Application/{Doom,Chromium}/Start.c`
 - ネイティブ・コンポジタ（ブリッジ先）: `Userland/Application/com.ImplusOS.windowmanager/`
 - AF_UNIX: `Kernel/IPC/UnixSocket.c`
+
+## Interactive move and resize (done)
+
+GTK3 draws its own decorations inside the surface, so a title-bar drag
+reaches the compositor only as `xdg_toplevel.move` (opcode 5), and a border
+drag as `xdg_toplevel.resize` (opcode 6). Both were no-ops, which is why a
+Wayland window could be seen but never moved or resized.
+
+`Compositor.c` now runs an interactive grab between such a request and the
+button coming up: the pointer belongs to the compositor for the duration and
+the client sees none of it, so GTK does not also treat the drag as a click.
+A resize is a stream of `xdg_toplevel.configure` events -- only the client
+can produce a buffer of a different size -- and the window changes shape when
+it commits. `Tests/run.sh` with a scripted drag (`WLC_INPUT`) verifies the
+window tracks the pointer.
+
+The hosted output is no longer an ordinary window titled "Wayland". It is
+the session's surface: positioned at the origin, sized to the work area and
+marked `window_set_system()`, which in the window manager now means
+"chrome -- no frame, no taskbar entry" and nothing else. It used to also mean
+"panel layer, never focused", and since the compositor only routes input to
+the focused window, that combination had left a hosted session visible and
+dead.

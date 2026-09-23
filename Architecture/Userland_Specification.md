@@ -146,8 +146,10 @@ Userland/Application/
 ├── com.ImplusOS.windowmanager/   compositing window manager
 │   ├── Makefile
 │   ├── Core/  Compositor/  SceneGraph/  Decoration/  Animation/
-│   ├── Input/  IPC/  Font/  Theme/  UI/  Tests/
-│   └── Resource/{Background.png, Fonts/, Icons/, Themes/, Apps/apps.list}
+│   ├── Input/  IPC/  Font/  Theme/  UI/  Linux/  Tests/
+│   └── Resource/{Background.png, Fonts/, Icons/, Themes/,
+│                 Applications/*.desktop, Apps/{apps.list, desktop.icons}}
+├── com.ImplusOS.linuxapp/        generic X11 host for a foreign Linux program
 ├── com.ImplusOS.sysnotif/        notification daemon
 └── BusyBox/                      BusyBox port (Resource/busybox binary)
 ```
@@ -177,11 +179,159 @@ include `Userland/Service/Common.mk`.
 ### Window Manager (`com.ImplusOS.windowmanager`)
 
 - Registers as the WM service via the `window_register_service()` syscall.
-- Compositor with a scene graph, window decorations, animation, themes and a
-  taskbar/app launcher (`Resource/Apps/apps.list`).
+- Compositor with a scene graph, window decorations, animation, themes, a
+  taskbar and a Start menu.
 - Manages window stacking and focus; forwards keyboard/mouse events to the
   focused window over IPC.
 - Renders via direct framebuffer access.
+
+#### Design system (`Userland/API/Source/Material.[ch]`, `Theme/WM_Theme.c`)
+
+The shell is drawn entirely in **Material Design 3** tokens. Nothing in the
+window manager names a colour directly; every surface, outline and piece of
+text names an M3 role, so the whole desktop is retinted by changing one
+value.
+
+- **Colour.** One seed colour expands into five tonal palettes (primary,
+  secondary, tertiary, neutral, neutral-variant) plus M3's fixed error
+  palette, which `m3_scheme_init()` maps onto the standard role names
+  (`primary`, `on_primary_container`, `surface_container_high`,
+  `outline_variant`, ...) for either the light or the dark scheme. Tones are
+  produced in CIE LCh(ab) -- hue and chroma held, chroma reduced until the
+  tone is inside sRGB -- which lands within a few code points of M3's
+  published baseline palettes; `Tests/MaterialTest.c` checks that against
+  the specification. The default seed is M3's own baseline, `#6750A4`.
+- **Shape.** The M3 shape scale (`WM_M3_SHAPE_EXTRA_SMALL` 4 through
+  `EXTRA_LARGE` 28, plus `FULL` for a stadium), resolved against each
+  component's box by `m3_shape_radius()`.
+- **Elevation.** Levels 0-5. In the light scheme a level tints its container
+  toward `surface_tint`; in the dark scheme the surface-container tones
+  carry it instead, as M3 specifies. Every raised surface draws its key
+  light through `wm_canvas_elevation_shadow()`, so a level looks the same
+  height wherever it appears.
+- **State layers.** Hover 8%, focus 10%, pressed 10%, dragged 16% of the
+  "on" colour over the component's own container (`m3_state_layer()`).
+- **Type.** The M3 type scale in pixels (`title_large`, `body_medium`,
+  `label_small`, ...), with a theme-wide multiplier.
+- **Motion.** M3's emphasized-decelerate curve on the way in and
+  emphasized-accelerate on the way out, with the M3 duration tokens
+  (`m3_ease()`, `M3_DURATION_*`).
+
+Themes are `.theme` files (`Resource/Themes/Material.theme`,
+`Material-Dark.theme`). A theme names a `seed`, a `mode` (`light`/`dark`), a
+`type_scale` and the four metrics that are the shell's own -- title bar
+height, window corner radius, shadow spread, taskbar height -- and may
+override individual colour roles by their M3 name. The window manager reads
+`/var/System/shell.theme` first, then the shipped light theme; failing both
+it keeps the baseline defaults. The `WM_SET_THEME` IPC message re-seeds the
+scheme from the accent colour it carries.
+
+The token module is shared, not the shell's own: the login screen and every
+application built on ImUI generate the same scheme from the same theme file
+(`m3_load_desktop_theme()`, `MaterialTheme.c`). The shell applies a new seed
+at once, over the `WM_SET_THEME` message; applications pick it up the next
+time they start. `com.ImplusOS.settings` is what sends both.
+
+`AppUITheme.h` holds the same roles as compile-time constants, frozen at the
+baseline seed, for a program that wants to match the shell without linking
+the palette generator.
+
+#### Applications and ImUI
+
+First-party applications are built on **ImUI** (`Userland/API/Source/ImUI.[ch]`),
+a small retained-mode toolkit whose every widget is a Material Design 3
+component drawn from the tokens above: text/filled/tonal/outlined buttons
+(`imui_set_variant()`), filled text fields, navigation-drawer-style list
+items, outlined cards, filled toolbars and the M3 type scale
+(`imui_set_type_role()`). The scheme comes from the desktop's theme file at
+startup, so an app follows a retint without knowing about it.
+
+| Application | What it is |
+|---|---|
+| `com.ImplusOS.editor` | text editor |
+| `com.ImplusOS.filemanager` | file browser |
+| `com.ImplusOS.serialmonitor` | COM1 debug log viewer |
+| `com.ImplusOS.settings` | desktop colour scheme (seed + light/dark), CPU/memory/graphics, devices, disks |
+| `com.ImplusOS.processmanager` | running processes with live CPU share and memory, and a way to end one |
+
+#### Application list (`Linux/WM_DesktopEntry.c`)
+
+The Start menu and the desktop icons are built from **freedesktop.org desktop
+entries**, the same `.desktop` files a Linux distribution uses. This is what
+lets a program from the staged Debian runtime appear on the desktop without a
+line of C being written for it.
+
+Search directories, highest precedence first:
+
+| Directory | Holds |
+|---|---|
+| `/var/System/applications` | the user's own entries and overrides (writable tmpfs) |
+| `/Userland/com.ImplusOS.windowmanager/Resource/Applications` | the entries shipped with the image |
+| `/usr/local/share/applications` | local additions |
+| `/usr/share/applications` | whatever `Vendor/LinuxRuntime` staged from the Debian packages |
+
+An entry is identified by its **desktop file ID** (its filename), and the
+first directory that supplies that ID decides — including deciding to hide it
+with `NoDisplay=true`. Shipping `Resource/Applications/debian-xterm.desktop`
+therefore replaces the entry the `xterm` package installs, without touching
+the packaged file.
+
+Keys read: `Type` (only `Application` is offered), `Name`, `Comment`,
+`GenericName`, their `[ja]` forms (preferred, matching the rest of the UI),
+`Exec`, `TryExec`, `Icon`, `Categories`, `NoDisplay`, `Hidden`. `Exec` has its
+field codes (`%f`, `%U`, …) stripped and a bare program name resolved against
+`/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/games`; an entry whose program is
+not on the image is dropped, which is what keeps Debian's descriptions of
+software this image does not ship out of the menu.
+
+Two ImplusOS-specific keys:
+
+| Key | Meaning |
+|---|---|
+| `X-ImplusOS-Linux=true` | what finally runs is a foreign glibc binary, even though `Exec` names a native launcher. Draws the "Linux" chip in the Start menu. |
+| `X-ImplusOS-Geometry=WxH` | the window size the host launcher should ask for. |
+
+`Icon` is resolved to a PNG under `/usr/share/icons/{hicolor,Adwaita}/<size>/apps`
+or `/usr/share/pixmaps` (largest size first; SVG and XPM cannot be decoded), and
+failing that against the standard freedesktop icon names — `utilities-terminal`,
+`system-file-manager`, `accessories-text-editor`, … — which are drawn with the
+shell's own vector iconography (`UI/WM_Icons.c`). A foreign program also gets
+its executable's basename tried as an icon name, which is how Debian's xterm
+ends up with the `xterm.png` its package ships even though its entry asks for
+`mini.xterm` (an XPM).
+
+Legacy fallbacks, used only when the scan finds nothing at all — that is, on a
+damaged image: `Resource/Apps/apps.list`
+(`Name|Path|Badge|Category|Comment|Argument`), then a small built-in table.
+
+The desktop icons come from `/var/System/desktop.icons`, falling back to
+`Resource/Apps/desktop.icons` (`Label|Path|Argument`, all but the path
+optional). They fill top to bottom and wrap into further columns, and an icon
+whose target matches a Start-menu entry is drawn with that entry's icon and
+name.
+
+`[wm] launcher: N app(s) from M desktop entr(y|ies), K running Linux binaries`
+is logged to COM1 on every boot.
+
+### Linux Application Host (`com.ImplusOS.linuxapp`)
+
+The generic host for a foreign X11 program: it creates a window, brings up (or
+joins) Xorg with that window's backing store as the KMS scanout target, spawns
+the program as an X client and pumps input into `/dev/input/event*` — all of
+which is `Userland/API/XSession.c`. It takes
+
+```
+[Title|][WxH|]/usr/bin/program --flags
+```
+
+as its launch argument, which is what the Start menu passes for an entry whose
+`Exec` is not a native `.ELF`.
+
+The launchers that remain program-specific are the ones that do something this
+cannot: `Chromium` drops privileges to uid 1000 before spawning (its sandbox
+refuses to start as root), `Doom` and `Terminal` predate this and keep their
+own tuned command lines, and `com.ImplusOS.gtk3demo` runs a Wayland compositor
+rather than an X server.
 
 ### Notification Daemon (`com.ImplusOS.sysnotif`)
 
@@ -190,7 +340,7 @@ include `Userland/Service/Common.mk`.
 
 ### BusyBox (`Userland/Application/BusyBox/`)
 
-- BusyBox port; the launcher entry in `apps.list` points at
+- BusyBox port; `Resource/Applications/com.ImplusOS.busybox.desktop` points at
   `/Userland/BusyBox/BusyBox.ELF`. The `busybox` binary resource is gitignored
   and supplied at build time.
 
