@@ -967,7 +967,9 @@ Chromium トラックと同じ基盤の上で **GTK3 / Wayland バイナリ**を
   GSettings スキーマ 38 本をホスト `glib-compile-schemas` で `gschemas.compiled`
   に、DejaVu フォント + `/etc/fonts/fonts.conf`。gdk-pixbuf `loaders.cache` は
   ホストにツールが無く未生成（G4 で対応、画像は出ないがウィンドウは出る想定）。
-- `Kernel/Core/process/ProcessManager_Create.c` の `glibc_envp` に
+- `Kernel/Core/process/ProcessManager_Create.c` の既定 envp（**2026-09-29 以降は
+  POSIX 汎用のみ**。以下は当時 `glibc_envp` に追加した内容で、現状はユーザランド
+  `Userland/API/Source/LinuxEnv.c` の `linux_env_add_desktop()` が提供）に
   `HOME` / `XDG_RUNTIME_DIR=/tmp` ほか XDG / `GDK_BACKEND=wayland,x11` /
   `GSETTINGS_SCHEMA_DIR` / `GSETTINGS_BACKEND=memory` / `FONTCONFIG_*` を追加。
   ネイティブ経路不変、Chromium にも無害。

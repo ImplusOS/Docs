@@ -138,10 +138,14 @@ $S/lib64/ld-linux-x86-64.so.2 --library-path $S/usr/lib/x86_64-linux-gnu \
   `/bin/sh -c` で起動するため、トップ Makefile の `STAGE_POSIX_SHELL` が静的
   busybox を `/bin/sh` として置いている。argv[0] が `sh` なら ash applet になる。
 - `/etc/passwd` も既に `root:x:0:0:root:/root:/bin/sh`（`EtcFS.c`）。
-- `glibc_envp`（`ProcessManager_Create.c`）に追加:
-  `SHELL=/bin/sh`（xterm は `$SHELL` を先に見る。絶対パスが取れないと
-  "No absolute path found for shell" で終了する）、`TERM=xterm`、
-  `XFILESEARCHPATH`（Xt の app-defaults 探索先）。
+- 既定 envp に追加（**2026-09-29 に移設済み**）:
+  - `SHELL=/bin/sh`（xterm は `$SHELL` を先に見る。絶対パスが取れないと
+    "No absolute path found for shell" で終了する）、`TERM=xterm` は POSIX
+    汎用なので**カーネル側の既定 envp**（`Kernel/Core/process/ProcessManager_Create.c`）に残置。
+  - `XFILESEARCHPATH`（Xt の app-defaults 探索先）はアプリケーション固有なので
+    ユーザランドの `Userland/API/Source/LinuxEnv.c`
+    （`linux_env_add_x11()` → `xsession_run()` が自動付与）へ移した。
+    ランチャーから env を渡すには `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）を使う。
 
 ---
 

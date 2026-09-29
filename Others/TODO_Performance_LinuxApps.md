@@ -302,9 +302,16 @@ Linux アプリ側の実測は QEMU 上での対話操作が要るので未実�
   残件）。入力を繋ぐときは、既に `syscall_futex_on_timer_tick()` が
   タイマ割り込みから `process_wake_pid()` を呼んでいるのと同じ扱いでよい
   （プロセステーブルロックは常に IRQ マスク下で取られる）
-- **poll 待ちのフォールバック 8 ms**。実起床が入ったので延ばして
-  アイドル時の CPU を減らせるが、まだ `poll_wait_notify()` を呼んでいない
-  イベント源の遅延が伸びるので据え置き
+- **poll 待ちのフォールバック 8 ms** → **上げた（2026-09-28、§10）**。
+  `EPOLL_POLL_SLICE_MS` / `LX_WAIT_SLICE_MS` / `LINUX_POLL_SLICE_MS` を
+  すべて 16 ms に。Linux ABI の syscall/s は 8,946 → 1,598（5.6 倍減）、
+  うち待機系は 8,266 → 1,069/s（7.7 倍減）。`notify` を呼ばないイベント源の
+  遅延上限も 1 → 16 ms に伸びるが、`[sysprof]` に timerfd / signalfd が一度も
+  出ない（Chromium・Xorg・WM とも未使用）ので、この 2 つの notify 追加は
+  保留のまま。シグナルは `process_signal_deliver{,_group}` の unlock 後に
+  notify を入れた — §4 の一覧には無かったが、入れないとスライス延長がそのまま
+  EINTR / SIGCHLD の遅延上限になる。`wait4` は子の終了時に独立に入っている
+  `poll_wait_notify()` で起きるので、この追加が無いと困る経路では無い
 
 ---
 
@@ -437,3 +444,191 @@ ATAPI・トレース・UART の修正はこのスイッチと独立。
 - 上記のとおり、§0 のログにあった **58.8 秒以降の停止が直ったかどうかも未確認**。
   原因（9.3 のスピン）は特定できているが、直ったことの確認は Terminal を
   開くまで待つ必要がある
+
+---
+
+## 10. 計測ベースの軽量化（2026-09-28）
+
+「起動時間」「CPU 負荷」「メモリ使用量」の 3 点を、**まず QEMU で実測して
+から**支配的要素を直した。以下はすべて同一条件の連続実行どうしの比較で、
+数値は `run3`（変更前ベースライン）と `run6`（変更後）の実測値。
+
+### 10.1 計測ハーネス
+
+- `/tmp/opencode/bench.py <dir> <秒> <間隔>` — LiveCD を KVM・ヘッドレスで
+  ブートし、①シリアル全バイト（ホスト壁時刻を小数 3 桁で前置）、
+  ②QEMU vCPU のホスト側 CPU 消費（`cpu-s/秒` の差分）、③定期スクリーン
+  ショットを `<dir>` へ
+- `make image_livecd AUTOSTART="/Userland/PerfProbe/PerfProbe.ELF
+  /Userland/Chromium/Chromium.ELF"
+  EXTRA_KERNEL_CFLAGS=-DLINUX_SYSCALL_PROFILE=1` で、計測プローブと
+  Chromium を同時に自動起動し、Linux ABI のヒストグラム `[sysprof]`
+  （100,000 件ごと）も取る
+- **音声は `-audiodev none,id=audio0` + `hda-duplex` が必須**。QEMU の既定は
+  PulseAudio へ接続を試みて 30 秒で抜け、**その間 vCPU が 1 も走らない**
+  （ホスト CPU 0.00 のままシリアルも無出力）。ベースラインの
+  「desktop up = 43.4 秒」はこの擬似遅れで、ハーネス修正後は 14.4 秒になる。
+  **起動時刻は必ずゲストの `at=` で比較すること**
+- 解析: `compare.py`（横並び表）/ `sysprof.py` / `steady.py` / `report.py`
+- `PerfProbe` の `mem=` を物理（PMM bitmap）、`heap=` をカーネルヒープに分離。
+  それまでの `mem=` は `get_used_memory()` をそのまま出していて、realloc の
+  縮小時に `used_memory` を引いていなかったため **15,076 MB** と出ていた
+  （`/proc/meminfo`・`sysinfo` も同様に物理量へ修正）
+
+### 10.2 結果
+
+| 指標 | run3（前） | run6（後） |
+|---|---|---|
+| Linux ABI syscall/s（定常 t=100–160 s） | 8,946 | **1,598**（5.6 倍減） |
+| うち待機系 epoll_wait/ppoll/poll | 8,266/s（92.4%） | **1,069/s**（7.7 倍減） |
+| ゲスト busy（同窓 mean / median） | 5.9 / 5.8 % | **5.6 / 5.4 %** |
+| ホスト CPU（同窓 mean / median） | 0.31 / 0.31 cpu-s/s | **0.30 / 0.30** |
+| chrome 起動（`[app] spawn`, guest ms） | 26,178 | **17,360** |
+| 最後の子プロセス exec（guest ms） | 55,607 | **35,760**（36%短縮） |
+| `[elfload]` 4 本の合計 | 56.0 s（run4） | **14.0 s**（75%短縮） |
+| 1 本あたり最大 | 20.6 s | **3.6 s** |
+| カーネルヒープ | 15,076 MB（誤計上） | **79 MB** |
+| 物理メモリ使用 | 計測不能 | **4,753 / 9,216 MB** |
+
+busy の 20 秒窓別プロファイルは run3 とおなじ平坦さ（4.8–6.9%）に戻った。
+run4 / run5 で見えていた t=160–200 s の山は、**ELF ロードが遅くて 4 本目の
+子プロセス exec が guest 70 秒までずれ込み、Chromium の起動処理そのものが
+その窓に入っていた**ことによるもので、スライス引き上げの副作用では無い
+（run6 でロードが 35.8 秒で終わると山ごと消える）。
+
+### 10.3 支配的コスト 1 — ATAPI の DMA 窓（解消済み）
+
+`[elfload]` は read / copy / map の 3 分解を出す。カウンタは**ロードごとの
+構造体**にした — ファイルスコープだと並行ロードで噛み合い、
+`read_ms=36306` が `total_ms=20590` の中に収まるという行が出た
+（`mb=` が 62 / 630 / 652 / 333 と散らばるのも同じ理由）。
+
+読み込みが支配的だった。`ahci_read()` の 1 コマンドは `AHCI_DMA_SECTORS`
+（64 セクタ = 32 KiB）で、ローダは 256 KiB チャンクで読むので
+**1 チャンク = 8 個の ATAPI READ(10)** になっていた。333 MB の chrome を
+1 回ロードするだけで **10,656 コマンド**、1 コマンドあたり約 682 µs、
+実効 46 MB/s。§2 と同じ「往復回数が全て」の構図が、もう一段粗い粒度で
+残っていた。
+
+`AHCI_DMA_SECTORS` を 1024（512 KiB）へ。ローダの 256 KiB チャンクが
+1 コマンドで完結する（`chunks=1336` がそのままコマンド数になる）。
+
+| 333 MB の 1 ロード | 前 | 後 |
+|---|---|---|
+| read | 7.3 s（46 MB/s） | **1.5 s（220 MB/s）** |
+| copy | 0.19 s | 0.11 s |
+| map | 2.2 s | 1.9 s |
+| 合計（並行 2 ロード込み） | 9.7–20.6 s | **3.3–3.6 s** |
+
+並行していた子プロセスの exec が互いのディスクロック待ちで 20 秒まで
+伸びていた分も、読みが速いだけで消えた。
+
+### 10.4 支配的コスト 2 — ページ割当（残）
+
+read が速くなった結果、`map` がロードの **半分**（333 MB = 85,248 ページで
+1.6–2.2 s ＝ **19–26 µs/ページ**）を占めるようになった。うち約半分は
+§10.7 のスキャンが占めていたことが分かった。残りの `paging_map_user_range_alloc()`
+は 1 ページごとに `alloc_page()`（IRQ マスク + `page_lock`）＋ 4 KiB の
+`memset()` ＋ 5 階層のテーブル探索をやっている。削る順:
+
+1. `p_filesz` の分は zero-fill をやめて、読み込み先を直接マップ済み物理ページに
+   （現状は staging へ読んでから zero + copy している）
+2. チャンク境界ごとに分かれる `alloc_page()` のロックとテーブル探索を
+   セグメント単位にまとめる
+3. さらに先は PT_LOAD の demand paging（`filemap_handle_fault()`）で、
+   exec を O(bytes) から O(触ったページ数) へ。同じ chrome を 1 回の spawn と
+   3 回の子 exec で 4 回読み直しているのも、ここでファイル側に cache が
+   できると消える
+
+### 10.5 測定上の限界
+
+- `[sysprof]` は 100,000 件ごとの窓なので、syscall が減ると窓が伸びる。
+  レートは後半の dump 間隔から出す（前半は起動で詰まっている）
+- guest busy はホストの割り込みで振れる。同じバイナリの run4 / run6 の
+  同窓 mean が 6.8 / 5.6、run5 が 6.8 だったので ±15% 程度は再現性がある。
+  これ未満の差を 1 回の実行で主張しない
+- `[elfload]` の read/copy/map はロードが並行している間は互いを含む。
+  `total_ms` と `mb` / `chunks` だけがロード単位で正確
+
+### 10.6 物理メモリの「総量」に PCI ホールが混入していた（解消済み）
+
+`get_total_memory_pages()` は `g_max_pages` を返していたが、これは**アドレスの
+上限**であって RAM の量ではない — 全 E820 ディスクリプタの最大終端アドレスを
+採るので、pc 機械の below-4G / above-4G の間に広がる **1,024 MiB の PCI ホール**
+がまくりこまれる。結果、`-m 8192` のマシンが「9,216 MB」になり、
+`total - free` で出す「使用量」には hole がまるごと含まれていた。
+
+- `g_usable_pages`（`is_usable_memory_type()` で PMM に解放した領域の合計）を
+  追加し、`get_total_memory_pages()` はそれを返す
+- 「ここまで物理アドレスが伸びるか」だけが答えの場合（Paging_Main の
+  identity map）は `get_physical_address_pages()`（旧値＝`g_max_pages`）を使う
+- ついでに `sysinfo` / `/proc/meminfo` の used・free をヒープ基準から物理
+  （PMM bitmap）基準へ。ヒープの `get_free_memory()` は「malloc 領域の空き」
+  であり `total_bytes` と比較できない量だった
+- 併せて `realloc()` の縮小時に `used_memory` がデビットされないバグを修正
+  （tail を free list に返しているのに計上はそのまま）。カーネルヒープ表示が
+  8 GB のマシンで 15,076 MB になっていたのはこの累積
+
+検証（run7、数値部分は汚染の影響を受けない）: **total 8,120 MB /
+used 3,658 MB / heap 79 MB**。9,216 − 8,120 = 1,096 MB がちょうど hole 分。
+
+### 10.7 支配的コスト 3 — 未実装スワップのための O(4096) 走査（対処済み）
+
+`swap_track_page()` / `swap_find_track()` は `g_swap_tracks[4096]`（≈96 KB）を
+**線形走査**する。しかも呼び出し箇所が hot なところに全部ある:
+
+- マップ: `paging_map_user_page()` の fast / slow 両パス
+- demand fault: `paging_handle_swap_fault()`
+- unmap: 1 ページごと
+- **アドレス空間破棄: PTE ごと**（Chromium の子プロセス exec / exit のたびに
+  そのプロセスが持つ全ページ分）
+
+追跡先は**永続に空**である。`swap_alloc_slot()` は呼び出し元が無く（ビルドの
+`defined but not used` 警告と一致）、`PAGE_SWAP` を PTE に立てる箇所も
+`swapped = 1` を書く箇所も存在せず、`paging_swap_reclaim_one_page()` は 0 を返す
+= **スワップアウトがそもそも未実装**。つまりこの表は何かを答えないのに、
+1 ページあたり「ミス走査（4096 全体）＋挿入走査（4096 全体）」の 2 回を
+払い続けていた。1 往復 ≒ 10–20 µs で、`map` が 19–26 µs/ページだった内訳と
+ほぼ一致し、ロードの map 相（1.6–2.2 s / 3.6 s）の**約半分**を占める。
+
+`g_swap_track_active = 0`（既定）で `swap_find_track()` / `swap_track_page()` を
+即 return にした。挙動は不変（追跡先は常に空なので、読む側も書き込む側も
+何も得ていない）、スワップアウトを実装したときに 1 へ flip するだけ。
+効果は map 相だけでなく、Chromium が取り続ける demand fault と、子プロセスの
+teardown にも及ぶはず（run9 で計測、数字は後追記）。
+
+### 10.8 計測汚染の判別と run7 の棄却
+
+run7（21:24:25–21:28:25）は**棄却**。同じホストで別ビルドが走っており、
+窓内に書き込まれたビルド成果物が **2,282 ファイル**あった
+（run3 / run4 / run5 / run6 はいずれも **0 件**）。
+
+vCPU がホストから予定を奪われると、次の 2 つが同時に起きる:
+
+1. **tick 喪失** — `get_uptime_ms()` は tick 基準（`XSession.c` のコメント
+   「interrupts are held off のときに遅れる」と同じ現象）。run7 の
+   `[probe] t=` は host timestamp に対し **25% 時間遅れ**（run6 は 1.2%）、
+   しかも t=40 s 以降ずっと一定レートで失われ続けた
+2. **busy 膨張** — `busy = 1 − idle/wall` は wall（TSC 基準）が進むのに
+   idle が積まれないので、runnable で走れない時間が busy になる
+   （5.6% → 25.1%）。hostcpu 0.30 → 0.99、`[elfload] read_ms` 1.5 → 5.9 s も
+   同じ理由（TSC 基準なので実時間を正しく測っていた＝本当に飢餓状態）
+
+対照として **syscall 数・page fault 数・画面は run6 とほぼ同一**だった
+（chrome の `sys=` 260,106 vs 263,850、`flt=` 29,706 vs 29,775、screendump の
+差分 194 px / 1M px）。つまり「アプリが 4 倍働いた」のではなく
+**「同じ仕事を 4 倍の時間でやった」**。メモリ表示（MemTotal / used / heap）は
+時間に依存しないので run7 の値は使える。
+
+**毎 run 確認する 3 点**（以後の run に適用）:
+
+```sh
+# 1. 窓内にビルドが無かったこと
+find Build Image -newermt "@$start" ! -newermt "@$end" | wc -l   # 0 であること
+# 2. tick が失われていないこと（[probe] t= の host に対する傾き ≈ 1.0）
+# 3. 別の qemu-system が同時に無かったこと（4 コアホストなので飽和する）
+```
+
+ハーネス側の対応: `bench.py` は ISO を `/tmp/opencode/bench.iso` にコピーして
+使う（`make run_uefi_usb` など他セッションが ISO を書ロックしていると、
+QEMU が `Failed to get shared "write" lock` で起動できない）。

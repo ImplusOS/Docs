@@ -63,6 +63,16 @@ Doom はただの GLX クライアントとして起動する。
 | `Kernel/Core/process/ProcessManager_Create.c` | 変更 | (a) 外来 ELF spawn 時、子プロセスの cwd を実行体のあるディレクトリに設定（`IdentifyVersion()` の `access("./doom1.wad")` 対策）。(b) `glibc_envp` に `LIBGL_ALWAYS_SOFTWARE=1` `GALLIUM_DRIVER=llvmpipe` `XKB_CONFIG_ROOT=/usr/share/X11/xkb` `DOOMWADDIR=/Userland/Doom/Resource` `SOUNDFONT=/Userland/Doom/Resource/soundfont.sf2` を追加。 |
 | `Kernel/IPC/UnixSocket.c` | 変更（1 行） | 先行の未コミット編集に `EPOLL*/POLL*` というコメント内 `*/` があり早期クローズしてビルド不能だったのを修正（`EPOLL / POLL`）。方法A とは独立の既存バグ。 |
 
+> **2026-09-29 の移設（以降の `glibc_envp` 記述すべてに適用）**: アプリケーション固有の
+> env（`LIBGL_ALWAYS_SOFTWARE` `GALLIUM_DRIVER` `XKB_CONFIG_ROOT` `DOOMWADDIR`
+> `SOUNDFONT` `ALSOFT_DRIVERS` `DISPLAY` `LD_PRELOAD=libgbm.so.1` など）は
+> カーネルからユーザランド `Userland/API/Source/LinuxEnv.c` へ移した。
+> カーネル `ProcessManager_Create.c` の既定 envp は POSIX 汎用（`PATH` `HOME`
+> `TERM` `SHELL` `LANG` `TZ` `XDG_*` …）と glibc 家族の `LD_LIBRARY_PATH` のみ。
+> env を渡すのは新しい `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）で、Doom は
+> `xsession_run_env()` + `linux_env_add_x11()` / `linux_env_add_doom()` で組み立てる。
+> 以下の記述の `glibc_envp` は旧称＝現 `linux_env_add_*()`（`Userland/API/Source/LinuxEnv.c`）。
+
 検証:
 ```
 make -C Vendor/LinuxRuntime resolve   # 177 sonames, 0 unresolved
@@ -408,7 +418,12 @@ libEGL 追加が無影響だったのも、EGL 到達前にここで死んでい
    （~120MB）の eager リロケーション時間 / glvnd の EGL vendor 探索パス。
 
 **残置している診断/暫定変更**:
-- `glibc_envp`: `LD_PRELOAD=libgbm.so.1`（恒久修正）、`LD_BIND_NOW=1`（libglx.so の壊れた遅延 fixup 経路を回避。恒久化するか、遅延 fixup 側のカーネル/ld.so バグを別途調べるか要判断）、`LD_WARN=1`（診断、無害）。
+- `Userland/API/Source/LinuxEnv.c`（旧カーネル `glibc_envp` から 2026-09-29 移設）:
+  `linux_env_add_xorg_server()` の `LD_PRELOAD=libgbm.so.1`（恒久修正）＋
+  `LD_BIND_NOW=1`（libglx.so の壊れた遅延 fixup 経路を回避。恒久化するか、遅延 fixup
+  側のカーネル/ld.so バグを別途調べるか要判断）。**両方とも Xorg サーバー spawn 時のみ**
+  （`XSession.c` が `linux_env_add_xorg_server()` を付与）で、他の外来バイナリには
+  渡さない＝遅延バインドの既定に戻した。`LD_WARN=1` は撤去済み（下 M6 参照）。
 - `Userland/Application/Doom/Start.c`: `DOOM_DIAGNOSTIC_XORG_ONLY 0`（Doom spawn 復活済み）。`XORG_SETTLE_MS 20000`（X が画面に出たら 4000 に戻す）。
 
 既知の非致命警告: `/usr/lib/xorg/protocol.txt` は deb に同梱されていない。X コアフォントは
@@ -660,6 +675,11 @@ Reading screen...
 |---|---|
 | `Kernel/Core/process/ProcessManager_Create.c` | `glibc_envp` に **`DISPLAY=:0`** を追加（＋なぜ必須かをコメント化） |
 | `Userland/Application/Doom/Start.c` | 誤ったコメントを訂正（envp はカーネル側 `glibc_envp` が組み立てる旨も明記） |
+
+※現状（2026-09-29）: `glibc_envp` は汎用既定のみに縮小し、`DISPLAY=:0` は
+`Userland/API/Source/LinuxEnv.c` の `linux_env_add_x11()` が提供する。
+`Doom/Start.c` は `xsession_run_env()` で `linux_env_add_x11()` +
+`linux_env_add_doom()` を `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）として渡す。
 
 ### 次ブートで見るもの
 
@@ -1761,7 +1781,8 @@ Doom が初期化を完走。**ブート全体で `Page fault` 0件**。スク�
 
 #### 診断時に踏んだ罠
 
-`glibc_envp` にはすでに `LD_PRELOAD=libgbm.so.1` が入っている
+`linux_env_add_xorg_server()`（旧 `glibc_envp`）にはすでに
+`LD_PRELOAD=libgbm.so.1` が入っている
 （`modesetting_drv.so` の未定義 `gbm_*` を埋めるのに必須）。glibc の ld.so は
 `LD_PRELOAD` を**最後の1つだけ**採用するので、診断用 preload を別行で足すと
 libgbm の preload が消えて Xorg が

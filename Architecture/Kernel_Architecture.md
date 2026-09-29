@@ -143,7 +143,14 @@ Both architectures use 4-level page tables:
 - Each process has its own address space (x86_64 CR3 / arm64 TTBR0_EL1)
 - Max processes: 256 (`OS_CONFIG_PROCESS_MAX_COUNT`, range 1–256)
 - Scheduling: Round-robin with timer-driven preemption
-- Process creation: `process_create_user()`, `process_spawn_user_elf()`
+- Process creation: `process_create_user()`,
+  `process_spawn_user_elf()` / `_with_arg()` / `_with_env()`
+  (the last one takes a caller-supplied, NULL-terminated `envp` copied out of
+  the caller's address space before the CR3 switch — syscall
+  `SYSCALL_PROCESS_SPAWN_ELF_ENV`, 277). The kernel still supplies a generic
+  POSIX default environment (plus the platform `LD_LIBRARY_PATH` for the
+  glibc family); application-specific entries live in
+  `Userland/API/Source/LinuxEnv.c`, not in the kernel.
 - Process states tracked via process table
 
 ### 4.2 Capability System

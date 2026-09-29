@@ -61,7 +61,7 @@ $ ld-linux-x86-64.so.2 --library-path <stage>/usr/lib/x86_64-linux-gnu \
 | `Kernel/Core/syscall/{Syscall_Main.h,Syscall_Dispatch.c,Syscall_File.c,Syscall_File.h}` | 変更（G3） | `SYSCALL_MEMFD_FROM_SHM`(273)：共有メモリ → memfd（`wl_keyboard.keymap` の fd 送出） |
 | `Userland/{Source/Syscalls.c,API/Source/Memory.h}`, `libc/I_libc/.../sys/syscalls.h` | 変更（G3） | `os_memfd_from_shm()` ラッパ |
 | `Userland/Application/com.ImplusOS.gtk3demo/Start.c` | 変更（G3） | ソケット待ち合わせ、compositor の再利用、クライアント／モードを引数で選択 |
-| `Kernel/Core/process/ProcessManager_Create.c` | 変更 | 外来 Linux ABI の既定 envp（`glibc_envp`）に `HOME` / `XDG_*` / `GDK_BACKEND=wayland,x11` / `GSETTINGS_SCHEMA_DIR` / `GSETTINGS_BACKEND=memory` / `FONTCONFIG_*` を追加。ネイティブ経路は不変、Chromium にも無害（GDK_BACKEND は Ozone が無視） |
+| `Kernel/Core/process/ProcessManager_Create.c` | 変更 | 外来 Linux ABI の既定 envp（`glibc_envp`）に `HOME` / `XDG_*` / `GDK_BACKEND=wayland,x11` / `GSETTINGS_SCHEMA_DIR` / `GSETTINGS_BACKEND=memory` / `FONTCONFIG_*` を追加。ネイティブ経路は不変、Chromium にも無害（GDK_BACKEND は Ozone が無視）。**2026-09-29**: カーネルは POSIX 汎用既定のみ残し、GTK/XDG 等のアプリ固有項目は `Userland/API/Source/LinuxEnv.c`（`linux_env_add_desktop()`）へ移設、`gtk3demo` が `process_spawn_with_env()` で渡す |
 
 ### `stage-gtkdata.sh` が STAGE_DIR に置くもの
 
@@ -103,6 +103,7 @@ $ ld-linux-x86-64.so.2 --library-path <stage>/usr/lib/x86_64-linux-gnu \
 - [x] `com.ImplusOS.gtk3demo` ランチャ（`make app_build` 通過）。
 - [x] `apps.list` に `GTK3 Demo`。
 - [x] `glibc_envp` に GTK/XDG/フォント環境変数（`make kernel` 通過）。
+      → **2026-09-29**: 同項目はユーザランド `Userland/API/Source/LinuxEnv.c` へ移設。
 - [x] ステージ実体だけでホスト素振り → `cannot open display` 到達を確認。
 - [x] **QEMU 実起動（1回目、2026-08-29 セッション17）**: `.so` 閉包 約60本すべて
       in-OS で open→mmap 成功、locale-archive も。glibc 初期化を完走し GLib の
@@ -209,7 +210,8 @@ Userland/Application/com.ImplusOS.waylandcompositor/Tests/run.sh
       `/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/` へ置き、
       同梱の ld.so 越しに同梱の query-loaders を走らせてキャッシュを生成し、
       STAGE_DIR 接頭辞を落としてゲスト上のパスに直す。
-      `glibc_envp` に `GDK_PIXBUF_MODULE_FILE` / `GDK_PIXBUF_MODULEDIR` も追加。
+      `glibc_envp`（現状は `Userland/API/Source/LinuxEnv.c` の
+      `linux_env_add_desktop()`）に `GDK_PIXBUF_MODULE_FILE` / `GDK_PIXBUF_MODULEDIR` も追加。
       **注**: png / jpeg は Debian のビルドでは libgdk_pixbuf 本体に組み込み
       （loaders/ に無いのはそのため）なので、§5 の PNG 問題はこのキャッシュ
       不在が原因ではない（ホストでキャッシュを外しても gtk3-demo は描画できる）。
@@ -305,7 +307,7 @@ QEMU 実起動で `gtk3-demo` を起動し、詰まるたびに原因を特定�
 | 3 | `GLib-CRITICAL: Failed to get RW lock: Resource deadlock avoided` が出続け、GSettings 初期化が無限ループ | `LINUX_CLONE_PARENT_SETTID` が **`0x00008000`（= `CLONE_PARENT`）**、正しくは `0x00100000`。新規スレッドの glibc `pd->tid` が 0 のままになり、rwlock が「未保持ロックの `__cur_writer`(=0) == 自分の tid(=0)」を自己デッドロックと誤検知 | 定数を修正 |
 | 4 | fontconfig がキャッシュを `/tmp` に書く所でカーネルが `free()` 内で #PF | カーネル `realloc()` のその場拡張が隣の空きブロックを吸収するとき `block->next` は書くのに**新しい後続ブロックの `prev` を直していない** | `Memory_Main.c`: splice の両端を直し、`heap_search_hint` も追従 |
 | 5 | （潜在）ライブラリのデータがゼロで読める | ファイルマッピング表が全プロセス共有 256 件、GTK3 クライアント 1 つで **291 件**登録して静かに溢れる | `FileMap.c`: 1024 件へ。溢れとショートリードを可視化 |
-| 6 | `gtk_init` の途中で無反応（syscall も出さない） | D-Bus が無いのに `DBUS_SESSION_BUS_ADDRESS` も無く、GDBus が `dbus-launch` を `posix_spawn` して待ち続ける | `glibc_envp` に `DBUS_SESSION_BUS_ADDRESS` / `NO_AT_BRIDGE` |
+| 6 | `gtk_init` の途中で無反応（syscall も出さない） | D-Bus が無いのに `DBUS_SESSION_BUS_ADDRESS` も無く、GDBus が `dbus-launch` を `posix_spawn` して待ち続ける | `linux_env_add_desktop()`（旧 `glibc_envp`、現状は `Userland/API/Source/LinuxEnv.c`）に `DBUS_SESSION_BUS_ADDRESS` / `NO_AT_BRIDGE` |
 | 7 | ローダも画像データも正しいのに `Unrecognized image file format` で `g_assert` 死 | gdk-pixbuf は形式判定に GIO の `g_content_type_guess()` を使う。**shared-mime-info の `mime.cache` が無いと何も名乗り出ない** | `stage-gtkdata.sh` が同梱の `update-mime-database` で生成 |
 | 8 | `Failed to load cursor theme Adwaita` → `cursor_theme_name` の `g_assert` 死 | カーソルテーマが 1 つも無い | `adwaita-icon-theme` を vendoring |
 | 9 | `wl_shm` バッファが 1 つも作れない（=カーソルテーマも読めない） | `fallocate(2)` が ENOSYS。libwayland は `memfd_create` + `posix_fallocate` でプールを作るので、glibc の手書きフォールバックがゼロ長 memfd に書けず失敗する | `Syscall_LinuxCompat.c`: `fallocate` を実装 |
@@ -360,7 +362,9 @@ GSList *(*get_formats)(void) = dlsym(h, "gdk_pixbuf_get_formats");
 - glibc 動的リンク基盤: [`TODO_glibc_Port.md`](TODO_glibc_Port.md)（実装ログ §11 セッション1–15）
 - カーネル Linux ABI 拡充: [`TODO_Chromium_LinuxABI.md`](TODO_Chromium_LinuxABI.md)
 - vendoring 機構: `Vendor/LinuxRuntime/README.md`, `resolve.sh`, `stage.sh`, `stage-gtkdata.sh`
-- 外来 ABI 既定 envp: `Kernel/Core/process/ProcessManager_Create.c`（`glibc_envp`）
+- 外来 ABI 既定 envp: `Kernel/Core/process/ProcessManager_Create.c`（POSIX 汎用のみ）＋
+  アプリケーション固有 env: `Userland/API/Source/LinuxEnv.c`
+  （`linux_env_add_*()` グループ、`xsession_run_env()` / `process_spawn_with_env()` で渡す）
 - ランチャ雛形: `Userland/Application/{Doom,Chromium}/Start.c`
 - ネイティブ・コンポジタ（ブリッジ先）: `Userland/Application/com.ImplusOS.windowmanager/`
 - AF_UNIX: `Kernel/IPC/UnixSocket.c`
