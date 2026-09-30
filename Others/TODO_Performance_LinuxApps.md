@@ -572,6 +572,72 @@ read が速くなった結果、`map` がロードの **半分**（333 MB = 85,2
 検証（run7、数値部分は汚染の影響を受けない）: **total 8,120 MB /
 used 3,658 MB / heap 79 MB**。9,216 − 8,120 = 1,096 MB がちょうど hole 分。
 
+---
+
+## 11. キーストローク遅延の実測と内訳（2026-09-30）
+
+`Kernel/Source/Debug/KeyTrace.h` とユーザーランド側の同名フック（`KEY_TRACE=1` で
+有効化）により、キー押下からピクセル変化までの各ステージを実測:
+
+| ステージ | タグ | 内容 | 実測（ktr6 / 4ms slice） |
+|---|---|---|---|
+| RD | `[ktr] RD` | USB HID → InputManager → WM ループ内 `wm_input_poll_raw_keyboard` | — |
+| OUT | `[ktr] OUT` | WM → IPC → XSession `xsession_forward_input` → Xorg read | RD→OUT **p50 4 ms / max 16 ms** |
+| MD | `[ktr] MD n` | Xorg がキーを配布し、クライアントが描画し、KMS mirror が dirty に | OUT→MD0 **p50 152 ms / max 956 ms** |
+| WC | `[ktr] WC n` | WM compositor が mirror を合成し、scanout へフリップ | OUT→WC0 **p50 ~180 ms / max ~220 ms** |
+| pixel | harness | ホスト側スクリーンショット差分で検出 | OUT→pixel **mean ~440 ms** |
+
+### 11.1 主要な発見
+
+1. **入力経路（RD→OUT）は健全** — 平均 4 ms、最大 16 ms。WM ループの 1 ms active sleep と 16 ms
+   frame interval が支配的で、カーネルの `poll_wait_notify()` による即時 wakeup は機能
+   している（16 ms のハード上限が無くなった）。
+
+2. **支配的コストは Chromium の描画（OUT→MD 100–200 ms / OUT→WC ~200 ms）**
+   — キーが Xorg に届いてから mirror dirty になるまで 100–200 ms、WM 側の合成＋
+   scanout は ≤20 ms（cursor 経路で実証済み）。つまり **Chromium 側の
+   KeyPress → paint → damage が 400 ms 近くかかっている**。これは
+   `--no-first-run` 追加後も変わらず、Chromium 固有の初回起動ダイアログ処理・
+   Sync/Background Networking の起動競合・llvmpipe ソフトウェアラスタライズが
+   絡むものと推定。
+
+3. **poll slice 16 ms → 4 ms は安全で有効** — 1 ms だと idle 時の WM busy が
+   33% まで跳ね上がり（rescan 率 1000/s）、4 ms だと 18% に抑えつつ、
+   未通知イベント源（timerfd / signalfd）への遅延上限も 4 ms に収まる。
+   キー遅延への寄与は <4 ms で、実測の 400 ms に埋没する。
+
+4. **QMP キー送信バグが過去の測定を汚染していた** — `key()` が key-down しか
+   送らず、キーが押しっぱなし状態で QEMU HID に蓄積 → transfer 欠落時に古いキーが
+   バースト再送され、Xorg オートリピートが重なり、**40–67% の idle_busy と
+   2.1–2.9 s の nav 遅延**を生んでいた。**修正: `key()` は常に down+up を送る。**
+
+5. **MD/WC の帰属ズレを修正** — 従来「最初の1フレームだけ記録」だったが、
+   無関係な dirty frame（カーソル点滅等）が先に来るとそれを「キーへの応答」と
+   誤判定していた。最大 4 フレームまで連番付きで記録し、最初の MD0 / WC0 を
+   キー応答として扱うように変更。
+
+6. **Chromium 起動フラグに `--no-first-run` を追加** — 毎回の ToS + Welcome ページ
+   表示（~19 s でツールバー描画）をスキップ。初回起動ダイアログが消えたが、
+   キー描画遅延の主因（Chromium 内部 paint 400 ms）は未解決。
+
+7. **「OS 全体が重い」は再現せず** — 修正後、Chromium 起動前は busy 4–6%（pid=0
+   idle 100%）、起動中は 54–84% であり、OS 自体が常に忙しいわけではない。
+   過去の 40–67% はキー押しっぱなし由来の測定汚染。
+
+### 11.2 今後のアクション
+
+- **Chromium 固有か確認**: xterm / GTK3 Demo 等の非 Chromium X クライアントで
+  同一ハーネス測定（QEMU 音声デバイス問題で未完）。
+- **EPOLL_POLL_SLICE_MS = 4 ms で固定**（4ms は 60Hz frame 内に収まり、
+  idle 時 rescan 250/s は許容範囲）。
+- **KEY_TRACE は既定 off**（ビルドフラグ無しで無効）。
+- `Docs/Others/TODO_Chromium_LinuxABI.md` §10.-5 / §3.4 を参照し、
+  Chromium の event loop / paint pipeline への通知経路（`poll_wait_notify`
+  相当）を実装するか検討 — 現状 X11 socket / eventfd には notify が来るが、
+  Chromium 内部の GPU/Renderer IPC 経路は未対応の可能性。
+
+---
+
 ### 10.7 支配的コスト 3 — 未実装スワップのための O(4096) 走査（対処済み）
 
 `swap_track_page()` / `swap_find_track()` は `g_swap_tracks[4096]`（≈96 KB）を
