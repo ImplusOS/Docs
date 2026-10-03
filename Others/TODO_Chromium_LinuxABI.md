@@ -769,7 +769,8 @@ ALSA のカーネル ABI を新設した（`Core/sound/ALSA.[ch]`、
 
 ### 13.6 残っていること
 
-- GPU は llvmpipe（§13.2）。virtio-gpu / virgl は未実装。
+- GPU は llvmpipe（§13.2）。virtio-gpu / virgl の**ゲスト側**は §14.1(1) で
+  実装したが、この開発環境ではホスト側の EGL が作れず検証できない（§14.5）。
 - この開発環境（WSL2 上の入れ子 KVM）では、Chromium の負荷中に
   **VM 全体が約 300 ms 止まる**現象が 1〜2 秒おきに起きる。全 vCPU の
   タイマ割り込みが同時に途切れ（`Timer.c` の `TIMER_GAP_TRACE=1` で観測）、
@@ -780,6 +781,173 @@ ALSA のカーネル ABI を新設した（`Core/sound/ALSA.[ch]`、
   いずれもシロ）。
 - CDP のページセッションがときどき応答しなくなる（テスト用の観測のみ）。
 - 音声の入力（キャプチャ）は無い。
+
+---
+
+## 14. DRM 現代化・PRIME・glamor — Chromium が実ページを描画するようになった (2026-10-03)
+
+§12.6 / §13.6 で残っていた GPU 前提を一通り実装し、**Chromium が
+`http://example.com/` を DNS から取得して描画する**ところまで到達した。
+検証は KVM・`-smp 1 -m 8192 -device virtio-gpu-pci -device virtio-net-pci` の
+QEMU に LiveCD（`make image_livecd AUTOSTART="/Userland/Chromium/Chromium.ELF"`）
+をぶっこんで行い、QMP `screendump` で画面を採る。
+
+### 14.1 実装した 5 項目
+
+| # | 項目 | 状態 |
+|---|---|---|
+| 1 | virtio-gpu 3D（virgl）のゲスト側 | `VIRTIO_GPU_F_VIRGL` をネゴシエートし、3D コマンドと `VirtIO.h/c` の公開 API を実装。**ホスト側で検証不能**（§14.5） |
+| 2 | DRM を dumb／レガシー modeset 超えへ（atomic・plane・**PRIME**） | `SET_CLIENT_CAP` の cap 2/3/4、atomic modeset（0xBC）、plane `type` プロパティ、`PRIME_HANDLE_TO_FD` / `PRIME_FD_TO_HANDLE` |
+| 3 | `/dev/dri/renderD128` を card0 のシャイムから分離 | 別セッション・別バッファ名前空間、modeset 系は `-EACCES` |
+| 4 | Xorg の glamor + DRI3 | `Allowing glamor on llvmpipe for PRIME` → `glamor initialized`、`Initializing extension DRI3` |
+| 5 | syscall の途中からの再開 | `linux_syscall_restart()` による RIP 復元 |
+
+### 14.2 PRIME — dma-buf を「デバイスノードなしの fd」として渡す
+
+dma-buf にはパスもマイナーも無いので、VFS の API を足さずに
+`FILE_USED_FILE` + `DEVFS_KIND_DRM_PRIME` の 1 種類で表現した。descriptor の
+`driver_data` に `kind | (index+1) << 8` と詰め、`file.fs_driver` は静的な
+`devfs_vfs_get_driver()` を指す。読みは `-22`、poll は `events & 0x4`、
+`fstat` は `S_IFCHR / st_rdev=1:5` を返すが、これは ioctl/mmap の振り分けに
+必要なため許容している。fd の割当は `syscall_file_install_dev()`
+（`syscall_file_open` の fd 段を写した 1 つ）が担い、`close_file` フックは
+`release_fd_locked_for` から 1 回だけ走る。
+
+参照は「ブロック表」方式。GEM ハンドルが `prime` フィールドに持つインデックスの
+参照を数え、0 になった時点でだけ PMM へ返す。**PMM に残っている kva で
+`prime_adopt_locked` を引くことはしていない**（解放済みブロックの再利用で
+use-after-free になるため、必ず新しいブロックを割り当てる）。
+`DESTROY_DUMB`・`GEM_CLOSE`・`drm_kms_close()`・`session_free()` の全てが
+この経由を通る。
+
+#### Linux ABI のユーザ fd 表が取りこぼし、GPU プロセスが EBADF で死んでいた
+
+Linux ABI はカーネルの fd 表の上に**プロセスごとの `user fd → global fd` 表**
+（`Linux_FdTable.c`）をかぶせ、`lx_fd_pre()` で syscall の fd 引数を書き換える。
+ところが PRIME の ioctl は**構造体の中に fd を載せる**ので、この書き換えが
+届かず、そのまま**グローバル fd 番号**が Linux ABI プロセスに渡っていた。
+`close(グローバル番号)` → `lxfd_remove()` → `LINUX_EBADF` →
+`base::ScopedFD` の CHECK が GPU プロセスを殺していた。
+
+`Syscall_LinuxCompat.c` の `syscall_ioctl_ex()` で 0x2D / 0x2E だけ特殊扱いし、
+書き出し側は `lxfd_install()` して**ユーザ番号を構造体へ書き戻す**、
+取り込み側はユーザ番号をグローバルへ直してから呼び、返る前に元の番号へ
+戻している。`O_CLOEXEC` も伝えるので exec で漏れない。
+
+### 14.3 足した／意図的に落とさなかった ioctl
+
+- `0xBB DRM_IOCTL_MODE_CURSOR2` — ハードウェアカーソルが無いので no-op に
+  したが、ENOTTY だと DDX が 0xA3 へフォールバックして modeset 失敗を掴む。
+- `0xC7 DRM_IOCTL_MODE_LIST_LESSEES` — リースは発行しないので **空リスト**。
+  ENOTTY にすると Xorg がリース機構の確立に失敗したと扱う。
+- 両方ともレンダーノードでは Linux 同様 `-EACCES`。
+- `0x3A WAIT_VBLANK` / `0x3B CRTC_GET_SEQUENCE` は **ENOTTY のまま**。
+  modesetting の vblank.c が想定しているフォールバックで、他は全部通る。
+
+### 14.4 検証結果（test25、クリーンビルド）
+
+診断（`PROCESS_MEMORY_REPORT` / `PMM_DOUBLE_FREE_CHECK` / 各種 trace）を
+**全部外した**出荷形態で:
+
+| 指標 | 結果 |
+|---|---|
+| 未処理 ioctl | `0x3A` ×2, `0x3B` ×1 のみ（意図どおり） |
+| `gbm_wrapper` の失敗 / PRIME 書き出し失敗 / `CREATE_DUMB bad` | **0** |
+| `malloc(): corrupted top size`・double-free・`FATAL` / `CHECK` | **0** |
+| glamor / DRI3 | `glamor initialized`・`Initializing extension DRI3` |
+| `net::ERR_FAILED (EIO)` | **0**（NIC 未接続時は 180 件。§14.7） |
+| 画面 | 75/100/125 秒の 3 フレームすべてで example.com を描画、md5 は全て相違 |
+
+Xorg の `(EE)`/`(WW)` は dbus が無い（`/run/dbus/system_bus_socket`）、
+`/dev/dri/card9` が存在しない（§12.6 のゲート用）、フォントディレクトリ欠落、
+`mouse0` の PreInit だけ。全て環境由来で、DRM/glamor 由来は 0 件。
+
+### 14.5 virgl をこの環境で試せない理由（確定）
+
+QEMU 10.2.1 には `virtio-gpu-gl-pci` も `egl-headless` も `libvirglrenderer.so.1`
+も揃っており、ゲスト側 Mesa にも `virtio_gpu_dri.so` が入っている。しかし:
+
+```
+qemu-system-x86_64: egl: no drm render node available
+```
+
+`egl-headless` は **ホスト側の DRM レンダノード**が無いと EGL ディスプレイを
+作れない。この環境は WSL2（`6.18.33.2-microsoft-standard-WSL2`、uid 1000）で
+`/dev/dri` は無く、`vkms` モジュールも無い（`modprobe: FATAL: Module vkms not found`）。
+`EGL_PLATFORM=surfaceless` でも同じエラーで落ちる。ホストにフレームバッファも
+無いので `gtk`/`sdl` へ逃げることもできない。
+
+さらに仮にホスト EGL が作れたとしても、Mesa の `virtio_gpu_dri.so` は
+`DRM_IOCTL_VIRTGPU_*`（resource_create / execbuffer / context / blob / fence 等）
+を要求し、我々の DRM はまだそれを実装していない。**次にやるならそこから。**
+
+### 14.6 `chrome://gpu` が開かないのは自前の不具合ではなかった
+
+`launch.args` に `chrome://gpu` を置いても `--app=chrome://gpu` でも
+**新規タブに戻った**。Chromium のソースを読んで原因を確定した:
+
+```cpp
+// chrome/browser/ui/startup/url_util.cc
+bool ValidateLaunchUrlWebUnsafe(const GURL& url) {
+  ...
+  // chrome: scheme は headless + --allow-chrome-scheme-url のときだけ許可
+  return policy->IsWebSafeScheme(url.GetScheme()) || url.SchemeIs(url::kFileScheme)
+      || url_scheme_is_chrome || ...;
+}
+```
+
+- 位置引数は `StartupTabProviderImpl::ParseTabFromCommandLineArg()` が
+  `ValidateLaunchUrlWebUnsafe()` に通す。**`chrome://` は通常モードでは必ず棄却**。
+- `--app=` は `MaybeLaunchAppShortcutWindow()` で `IsWebSafeScheme() || file:`
+  しか受け付けない。`chrome://` は含まない。
+- 許されるのは **`http://` / `https://` / `file:` / `about:blank`**。
+
+なので起動 URL は `CHROME_START_URL = "http://example.com/"`（既定のまま）に
+戻した。`launch.args` は**リポジトリに置かない**（`Userland/.gitignore` が
+`/Application/Chromium/Resource` を除外しており、`CHROME_LAUNCH_ARGS_FILE`
+のコメントどおり「既定では出荷しない」扱い）。実際に開いた。
+
+### 14.7 ネットワークは動いていた（ハーネスに NIC が無かっただけ）
+
+検証ハーネスに `-netdev user` + `-device virtio-net-pci` を足した途端、
+`net_errors_posix.cc:127 net::ERR_FAILED (Input/output error 5)` が
+**180 件 → 0 件**になり、GCM は `DEPRECATED_ENDPOINT`（＝**サーバの応答本文**）
+を返すようになった。ゲストは `10.0.2.15/24 gw 10.0.2.2`（§`config.h` の既定）で
+QEMU user-net に当たり、DNS から HTTP まで通っている。
+プロジェクトの `run_*` ターゲットは `QEMU_NET_DEVICES` で NIC を入れているので、
+ハーネス側の省略が原因だった。
+
+### 14.8 この節で外した診断
+
+`[drm] ioctl pid/sess/nr`（1 回 3600 行）、`drm_node_open_trace`、
+`drm_kms_close()` の close trace、`CREATE_DUMB bad`、`[drm] VERSION` /
+`SET_VERSION`、PRIME 失敗時 trace、`ProcessManager_Create.c` の
+`[exit-cause]` ×2、`LinuxEnv.c` の `EGL_LOG_LEVEL=debug` / `MESA_DEBUG=1` /
+`LD_DEBUG=files`。加えてビルドから `-DPROCESS_MEMORY_REPORT=1` と
+`-DPMM_DOUBLE_FREE_CHECK=1` を外した（**ソースは残してある**。どちらも
+`#ifndef` で既定 0、次に調査するとき `EXTRA_KERNEL_CFLAGS` で足せばよい。
+フラグを変えるときは `rm -rf Build/x86_64/Kernel` が必要 — Make はフラグを
+追跡しない）。
+`[drm] unhandled ioctl nr=` は**残した**。1 起動あたり 3 行で、抜けている
+ioctl を見つける唯一の手がかりだから。
+
+### 14.9 残っていること
+
+- **PMM の二重解放は 5 回連続で 0 件**だが、`drm_kms_close()` /
+  `drm_render_close()` は「ノードを閉じた全員」でセッションを解放している。
+  dumb バッファに `PAGE_EXTERNAL` を付けたことで破壊は再現しなくなったので
+  **per-open の参照カウントは据え置き**。再発したら着手する。
+- 中国語（CJK）だけ豆腐で出る。アラビア語・キリル・ラテンは正常。
+  フォント側の問題。
+- Chromium の **`chrome://gpu` が読めない**（§14.6 の制約）。GPU 機能の
+  自己申告は未取得。代わりに、GPU プロセスが Mesa GBM を初期化し
+  dma-buf を 40 回書き出し 0 失敗、EGL/GL のエラーが 0 件であること、
+  glamor + DRI3 が上がっていることで間接的に担保している。
+- レンダプロセスの生成が 100 秒で 35 回ある（`zygote_host_impl_linux.cc:312`
+  の `Failed to adjust OOM score ... EIO` は ProcFS に
+  `/proc/<pid>/oom_score_adj` が無いだけ）。退出は 1 回を除き全て status 0。
+  生成数が多い理由は未調査。
+- `drm_kms_init()` は二重呼び出しに対するガードが無い（既存の隐患）。
 
 ---
 
