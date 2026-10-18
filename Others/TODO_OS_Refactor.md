@@ -61,7 +61,7 @@
 Kernel/
 ├── Driver/                    ← ソースではなく "マニフェスト+ファームウェア置き場"
 │   ├── DriverDB.txt           ← usb/pci vid → オンデマンドロードするELF名の手書き対応表
-│   └── Firmware/AX900/        ← ファームウェアBLOBをそのままステージするだけ
+│   └── Firmware/AIC8800/      ← ファームウェアBLOBをそのままステージするだけ
 ├── Drivers/
 │   ├── Module/                ← DriverManager/DriverModule/BusRegistry/DeviceRegistry など
 │   │                             "カーネルに常駐するドライバ基盤" 本体
@@ -161,7 +161,7 @@ ACPI・IOAPIC/LAPIC・Timer は **ページング/ヒープ初期化の直後、
 
 一方、`network_stack_init()`（558行目）は `driver_module_init_deferred()` 実行後・
 ファイルシステム初期化後というかなり遅いタイミングで呼ばれており、こちらは既存の
-NIC ドライバモジュール機構（`driver_nic_t`, `AX900.c` 等）と同じ枠組みに素直に
+NIC ドライバモジュール機構（`driver_nic_t`, `AIC8800.c` 等）と同じ枠組みに素直に
 乗せられる。
 
 この非対称性（ACPI/Timer/LAPIC/IOAPIC は起動必須の「組込みドライバ」、
@@ -317,7 +317,7 @@ gcc-x86-64-elf` のような Ubuntu 固有パッケージ（Debian/Ubuntu 限定
 ブートイメージ上のパスは現状維持とする。
 - **ソースツリー側**（`Kernel/Driver/DriverDB.txt`, `Kernel/Driver/Firmware/`）は
   `Kernel/Drivers/` 配下に統合する（例: `Kernel/Drivers/Manifest/DriverDB.txt`,
-  `Kernel/Drivers/Firmware/AX900/`）。これは純粋にソース整理でありビルド成果物の
+  `Kernel/Drivers/Firmware/AIC8800/`）。これは純粋にソース整理でありビルド成果物の
   ESP 上パスとは独立に変更できる。
 - **ブートイメージ上のパス**（`Kernel/Driver/`, `Kernel/Driver/OnDemand/`,
   `Kernel/Driver/Firmware/`）は当面現状維持する。理由: これは実行時のファイル配置規約
@@ -363,7 +363,7 @@ gcc-x86-64-elf` のような Ubuntu 固有パッケージ（Debian/Ubuntu 限定
       NetSurf 側 `nsfb` ネイティブリンクの既知の想定内失敗で無関係）
 - [ ] 5.3節（既存ドライバの `bus_matches[]`/`probe()` 方式への移行、
       `BusRegistry` バインディング照会API、ホットプラグ経路の統一）は**未着手**。
-      AX900 のみが新方式を使っている状態が変わっていないため、着手する場合は
+      AIC8800 のみが新方式を使っている状態が変わっていないため、着手する場合は
       別途このセクションで進捗管理する
 
 **ユーザー確定事項**: 案Aをそのまま採択。
@@ -427,7 +427,7 @@ Kernel/Drivers/Server/FileSystem/FAT32/ → Kernel/Drivers/FileSystem/FAT32/
 （`Kernel/include/interfaces/driver_api.h:611-652`、API 2.2 で追加）は、
 Linux の `struct device_driver` の `probe`/`remove` と `MODULE_DEVICE_TABLE`
 に相当する良い設計だが、ドキュメントコメントにある通り **新しいドライバ
-（AX900等）だけが使っており、VirtIONet/I219V 等の既存ドライバは未だに
+（AIC8800等）だけが使っており、VirtIONet/I219V 等の既存ドライバは未だに
 「起動時に自分でバスをスキャンする」旧方式のまま**（`driver_api.h:611-617`
 のコメント参照）。
 

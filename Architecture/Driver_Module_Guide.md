@@ -66,7 +66,7 @@ driver's API.
 | Display | `DEVICE_TYPE_DISPLAY` | `ImplusOS_Generic_Display_Driver.ELF`, `VirtIO_Driver.ELF` | `driver_display_t` |
 | Input | `DEVICE_TYPE_INPUT` | `PS2_Driver.ELF` | `driver_input_t` |
 | USB Host | `DEVICE_TYPE_USB` | `USB_Driver.ELF` | `usb_master_vtable_t` |
-| NIC | `DEVICE_TYPE_NIC` | `VirtIONet_Driver.ELF`, `I219V` (Intel I219-V), `WiFi` / `AX900_Driver.ELF` (Wi-Fi, with `Firmware/AX900` blob) | `driver_nic_t` |
+| NIC | `DEVICE_TYPE_NIC` | `VirtIONet_Driver.ELF`, `I219V` (Intel I219-V), `AIC8800_Driver.ELF` (Wi-Fi, with `Firmware/AIC8800` blob) | `driver_nic_t` |
 | Block | `DEVICE_TYPE_BLOCK` | `AHCI_Driver.ELF`, `NVMe_Driver.ELF`, `VirtIOBlk_Driver.ELF` | `driver_storage_t` |
 | Audio | `DEVICE_TYPE_AUDIO` | `AC97_Driver.ELF`, `HDA_Driver.ELF`, `VirtIOSound_Driver.ELF` | (audio API) |
 | Serial / RTC | (platform) | `Kernel/Drivers/Serial/`, `Kernel/Platform/rtc/` | — |
@@ -396,14 +396,26 @@ typedef struct {
 - Source: `Kernel/Drivers/NIC/I219V/`
 - Intel I219-V (e1000e-class) wired NIC
 
-### AX900 Wi-Fi Driver
+### AIC8800D80 Wi-Fi Driver
 
-- Source: `Kernel/Drivers/Wi-Fi/AX900/` (also `Kernel/Drivers/NIC/WiFi/`)
-- Wi-Fi NIC presenting a `driver_nic_t`; needs the firmware blob staged from
-  `Kernel/Drivers/Firmware/AX900/`. WPA/association crypto comes from
-  `Library/Crypto/`. This is the driver that already uses the newer
-  `bus_matches[]` + `probe()` binding model (see
-  `Docs/Others/TODO_OS_Refactor.md` §5.3)
+- Source: `Kernel/Drivers/Wi-Fi/AIC8800/`
+- USB Wi-Fi NIC presenting a `driver_nic_t`, bound through the newer
+  `bus_matches[]` + `probe()` model (see `Docs/Others/TODO_OS_Refactor.md`
+  §5.3) and loaded on demand when the dongle enumerates.
+- The chip is a full-MAC design whose USB interface comes up twice: a ROM
+  loader image (its own product id) that accepts `DBG_MEM_*` writes, then
+  the vendor `fmacfw` patch+image, after which the running firmware
+  answers the normal message set (`TASK_MM`/`TASK_SCAN`/`TASK_SM`/...).
+  `AIC8800_Fw.c` drives the first half, `AIC8800_Bring.c` the second;
+  `AIC8800_Protocol.h` documents the wire format.
+- Firmware blobs are *not* shipped: `Kernel/Drivers/Firmware/AIC8800/`
+  ships empty and its README lists the six files to drop in. Without them
+  the driver stops cleanly and reports `DRIVER_WIFI_STATE_FIRMWARE_FAILED`.
+- WPA2-PSK runs in the driver (`AIC8800_Wpa.c`): association is firmware
+  side, the 4-way handshake (EAPOL-Key M1-M4, PBKDF2/HMAC-SHA1/AES key
+  unwrap from `AIC8800_Crypto.c`) is host side, and `ASSOCIATED` is only
+  reported once the PTK/GTK are installed. 802.11 <-> 802.3 conversion is
+  `AIC8800_Data.c`.
 
 ### Generic Display Driver (`ImplusOS_Generic_Display_Driver.ELF`)
 

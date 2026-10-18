@@ -156,4 +156,4 @@ void network_stack_on_timer_tick(void) {
 
 DHCP is driven centrally from here rather than by any specific NIC driver,
 so it works uniformly whether the active NIC is a wired VirtIO-Net device or
-an AX900 Wi-Fi association completing.
+a Wi-Fi association completing.
