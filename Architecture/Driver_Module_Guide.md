@@ -408,9 +408,12 @@ typedef struct {
   answers the normal message set (`TASK_MM`/`TASK_SCAN`/`TASK_SM`/...).
   `AIC8800_Fw.c` drives the first half, `AIC8800_Bring.c` the second;
   `AIC8800_Protocol.h` documents the wire format.
-- Firmware blobs are *not* shipped: `Kernel/Drivers/Firmware/AIC8800/`
-  ships empty and its README lists the six files to drop in. Without them
-  the driver stops cleanly and reports `DRIVER_WIFI_STATE_FIRMWARE_FAILED`.
+- Firmware blobs are proprietary AICSemi files, carried in
+  `Kernel/Source/Drivers/Firmware/AIC8800/` and staged into the image at
+  `/Kernel/Driver/Firmware/AIC8800/`; its README lists them and notes the
+  one variant the tree does not carry (`fmacfw_8800d80_h_u02.bin`, for H
+  chip revisions). Without them the driver stops cleanly and reports
+  `DRIVER_WIFI_STATE_FIRMWARE_FAILED`.
 - WPA2-PSK runs in the driver (`AIC8800_Wpa.c`): association is firmware
   side, the 4-way handshake (EAPOL-Key M1-M4, PBKDF2/HMAC-SHA1/AES key
   unwrap from `AIC8800_Crypto.c`) is host side, and `ASSOCIATED` is only

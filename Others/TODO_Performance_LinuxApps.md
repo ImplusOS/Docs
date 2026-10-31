@@ -698,3 +698,32 @@ find Build Image -newermt "@$start" ! -newermt "@$end" | wc -l   # 0 である�
 ハーネス側の対応: `bench.py` は ISO を `/tmp/opencode/bench.iso` にコピーして
 使う（`make run_uefi_usb` など他セッションが ISO を書ロックしていると、
 QEMU が `Failed to get shared "write" lock` で起動できない）。
+
+### 10.9 フレームバッファ経路の修正（2026-10-31）
+
+実機だけが重い症状に対して、QEMU では再現しない 4 点を修正した。
+QEMU のフレームバッファは RAM  backed で PAT を無視するため、1 は
+**実機でしか差が出ない**。
+
+| # | 根本原因 | 修正 |
+|---|---|---|
+| 1 | `paging_enable_wc_pat()` が PAT エントリ 1 を WC にしていたが、WC マッピングは `PAGE_PWT \| PAGE_PAT` = **エントリ 5** を選択する。エントリ 5 の電源投入時既定は WT (0x04)。さらに PAT MSR は CPU ごとなのに BSP しか設定していなかった | `paging_setup_pat()`（`Arch/x86_64/mmu/Paging_Main.c`）がエントリ 1 と 5 の両方を WC にし、`init_paging()`（BSP）と `ap_entry_c()`（各 AP）から呼ぶ。起動時に `[pat] power-on MSR 0x277 = ...` / `[pat] ... now 0x...` をシリアルへ 1 CPU 1 行出力 |
+| 2 | `fb_present()` が 1080p で約 8 MB を 1 回の `cli` で転送し、タイマ割り込みを取りこぼしていた（§10.8 の tick 喪失と同じ症状） | `generic_copy_bytes()`（`Drivers/Display/ImplusOS_Generic.c`）が 64 KiB ごとのウィンドウに分割。ウィンドウ間は `sti; pause` で保留中の tick を 1 回通す。呼び出し元が元々 `cli` だった場合は分割せず従来どおり |
+| 3 | 共有ユーザランドオブジェクト（`Makefile` の `USERLAND_CFLAGS`）・ドライバモジュール（`Drivers/module.mk`）・サービス（`Service/Source/Common.mk`, ldso/dynmain）が `-Os`。`wm_color_blend()` は `-Os` で画素ごとに `div`、`-O2` で 0 個 | すべて `-O2` に統一（WM 本体は既に `-O2`） |
+| 4 | `memcpy`/`memset`/`memmove` が 8 バイト 1 回のループ | 64 バイト（`memcpy`/`memset`）・32 バイト（`memmove` 後方）の展開に変更。`memcpy` のローカル `__restrict` によりユーザランドの `-O2` では SSE の 16 バイトストアに融合される。カーネルは `-mgeneral-regs-only` のまま 8 バイト×8 の独立ストア |
+
+**実機での白黒判定**: 起動ログの `[pat] power-on MSR 0x277 = 0x0007040600070406`
+ならファームウェアは既定値のまま。直後の行が `... now 0x0007010600070106`
+（エントリ 1,5 が 0x01=WC）になっていれば修正が効いている。
+`power-on` の値が既定と違う場合はファームウェアが PAT を触っているので、
+その値を控えておく。
+
+**QEMU での退行確認**: §10.8 の 3 点（ビルド無し・`[probe] t=` の傾き・
+単独 QEMU）に加えて、`[pat]` 行が CPU 数だけ出ること、boot 時間が
+10.4〜11.1 秒に収まることを確認する。
+
+`run_uefi_*` は `QEMU_SMP`（既定 4）を定義していたが `-smp` を QEMU へ
+渡していなかったため、これまでの QEMU 検証はすべて 1 vCPU で走っていた
+（AP 側の PAT 設定は実機でしか実行されていなかった）。`QEMU_COMMON` に
+`-smp $(QEMU_SMP)` を追加したので、以後の run は既定で 4 vCPU になる。
+1 vCPU で切り分けたいときは従来どおり `QEMU_SMP=1` を渡す。

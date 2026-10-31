@@ -1884,6 +1884,12 @@ DeviceRegistry の先頭から `init()` が true を返した最初の 1 つを�
 (`nic_wifi_*`) も active NIC 経由なので Wi-Fi パネルが死ぬ。NIC 選択の再実行、
 または Wi-Fi 管理系を active NIC から切り離すのが本筋。
 
+**その後（AIC8800D80 ドライバへの書き直しで解消）**: `NIC.c` は Wi-Fi 対応
+ドライバを優先する 2 パス初期化（無線が無ければ従来どおり最初の NIC）になり、
+`nic_wifi_*` は active NIC ではなく `wifi_get_status` を持つ NIC を探すように
+なった。AX900 は `Kernel/Source/Drivers/Wi-Fi/AIC8800/` に置き換え済み
+（firmware ローダ → bring-up → scan → WPA2 → データパス）。
+
 ## M27. 実機だけ Chromium が `ProcessSingleton` で落ちる — TmpFS のディレクトリハンドルが 8 個しかなかった
 
 M25 の FAT32 修正でモジュール探索は通るようになり(`Failed to load module` が消え、
