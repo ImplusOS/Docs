@@ -1,0 +1,28 @@
+Subsystem,Feature,Current ImplusOS source,Required i915-equivalent state,Priority,Verification
+PCI,Gen9.5 allowlist,Partial; selected IDs only,Platform/revision capability tables and validated workarounds,P0,PCI ID/revision matrix
+Core,MMIO mapping,Partial; BAR0 map in display module,Parent device/resource ownership and checked MMIO access,P0,MMIO bounds/readback
+Power,Forcewake,Partial; bounded request/ack,Domain refcount and display power-well sequencing,P0,Repeated acquire/release and suspend tests
+Display,Framebuffer present,Implemented; CPU fallback plus BCS path,Retain as fallback; integrate into KMS framebuffer objects,P0,Visual and stress tests
+Display,Connector detection,Not implemented,HDMI/DP/eDP connector + encoder discovery,P1,Hotplug matrix
+Display,EDID/DDC,Not implemented,EDID/DDC read + mode validation,P1,Monitor EDID fixtures and hardware
+Display,DisplayPort AUX/link training,Not implemented,PHY/AUX/link training and fallback,P1,DP rate/lane matrix
+Display,HDMI mode setting,Not implemented,PLL/DDI/transcoder/pipe/plane atomic programming,P1,Mode matrix
+Display,Atomic KMS,Not implemented; single set_mode callback,Atomic check/commit and rollback,P1,Atomic test suite
+Display,VBlank/page flip,Not implemented,IRQ-driven vblank and page-flip events,P1,Sequence/timing tests
+Memory,GGTT,Partial; driver-private mappings,Global allocator, ownership, eviction/reservation,P1,PTE/TLB test suite
+Memory,PPGTT,Not implemented,Per-process page tables and isolation,P2,VA isolation tests
+Memory,GEM-like objects,Not implemented,Handles, pin/unpin, mmap, object lifetime,P2,Leak/use-after-free tests
+Memory,DMA scatter-gather,Not exposed,SG pages, DMA map/unmap, sync APIs,P0,DMA stress
+GT,BCS,Partial; ring + BLT self-test/present,Engine discovery/context/IRQ/scheduler/reset,P1,Repeated copy/fill workload
+GT,RCS 3D,Not implemented,Context + validated 3D command submission,P2,Render tests
+GT,VCS/VECS,Not implemented,Media engine submission/capabilities,P3,Codec tests
+GT,Command validation,Not implemented,Reject unsafe user batches and bad relocations,P2,Negative/fuzz tests
+GT,Fences/sync,Partial; internal fence sequence only,General GPU fence + user synchronization,P2,Timeout/order tests
+GT,Hang recovery,Partial fallback/disable idea,Hangcheck, engine/GT reset, error completion,P2,Injected hang tests
+Firmware,DMC,Not implemented,Versioned firmware parser/load/fallback,P1,Firmware matrix
+Firmware,GuC,Not implemented,Load/auth/submission or fallback,P2,GuC version matrix
+Firmware,HuC,Not implemented,Load/auth for supported media workloads,P3,HuC auth tests
+Power,Runtime PM/RC6,Not implemented,Reference-counted power management,P2,Suspend/resume stress
+Userspace,GPU UAPI,Not implemented,Buffer/VM/context/submit/sync APIs or i915 UAPI compatibility,P2,Mesa/sample UAPI tests
+Audio,Display audio,Not implemented,HDMI/DP audio integration,P3,Audio sink tests
+Advanced,PSR/FBC/HDCP/MST/perf,Not implemented,Feature-specific support and security checks,P4,Feature test matrix
