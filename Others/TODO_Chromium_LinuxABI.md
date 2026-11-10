@@ -673,11 +673,16 @@ Web Worker 4 本の計算で `hardwareConcurrency=4`、スループットは 1 �
 
 ### 13.2 GPU アクセラレーション
 
-`--ignore-gpu-blocklist` をランチャの既定フラグに加えた。`chrome://gpu` で
-Canvas / Compositing / Rasterization / WebGL / WebGPU / Video Decode が
-"Hardware accelerated" になる。ただし**実体は Mesa llvmpipe（CPU による
-GL 実装）上の ANGLE**である。QEMU の既定構成には GPU が無く、virtio-gpu
-（virgl）ドライバも未実装なので、真の GPU 加速ではない。
+`--ignore-gpu-blocklist` は**カーネルが本物の 3D レンダーノード
+（`SYSTEM_GRAPHICS_ACCEL_3D`、virtio-gpu/virgl）を報告したときだけ**ランチャが
+付ける（`Userland/Application/Chromium/Start.c` の `build_args()`）。
+`chrome://gpu` では Canvas / Compositing / Rasterization / WebGL / WebGPU /
+Video Decode が "Hardware accelerated" になるが、QEMU の既定構成には GPU が
+無く、実体は Mesa llvmpipe（CPU による GL 実装）上の ANGLE である。
+llvmpipe でこのフラグを付けると、ANGLE-on-llvmpipe と GLX/DRI3 の提示経路で
+854x480 の YouTube が約 3.5〜5.3 fps まで落ちた（フラグ無しのソフトウェア
+コンポジタは約 30 fps）。そのため「GPU があるときだけ有効」に変えた。
+virtio-gpu（virgl）ドライバのゲスト側は §14.1(1) で実装済み。
 
 ### 13.3 音声
 
@@ -948,6 +953,82 @@ ioctl を見つける唯一の手がかりだから。
   `/proc/<pid>/oom_score_adj` が無いだけ）。退出は 1 回を除き全て status 0。
   生成数が多い理由は未調査。
 - `drm_kms_init()` は二重呼び出しに対するガードが無い（既存の隐患）。
+
+---
+
+## 15. SysV 共有メモリとページ境界 — YouTube が止まらない・落ちない (2026-11-09)
+
+§13 の時点で「YouTube は実時間で最後まで再生される」と書いていたが、その後の
+DRM/glamor 変更を含むツリーでは、Chromium 起動直後に **Xorg とブラウザが
+`RIP=0x4246` でページフォルト**し、「If playback doesn't begin shortly,
+try restarting your device.」で止まっていた。原因は 2 つで、どちらも
+「共有メモリのページ境界」にあった。
+
+### 15.1 16 バイト境界のユーザアロケータがページを共有していた
+
+`process_user_alloc()` はサイズとバンプカーソルを **16 バイト**に丸めていたが、
+その裏の `paging_map_user_range_alloc()` は**ページ単位**でマップする。
+サイズがページの倍数でない確保（tmpfs の `share_map` はファイルの実サイズ）を
+挟むとカーソルがページ境界からずれ、次の確保のマップが前の確保の最終ページを
+新しいゼロページで置き換える。逆にどちらかを解放すると、もう一方のページが
+アンマップされる。Chromium のバッファがゼロで返り、戻りアドレスが
+`0x4246` に化けたのがこの症状。
+
+- `process_user_alloc()` のサイズとカーソルを `PAGE_SIZE` に丸める。
+- `shared_memory_map_ex()` は `page_count * PAGE_SIZE` を確保し、丸めずに
+  そのアドレスをマップする（`size + 0xFFF` の端数が次のスロットに食い込んで
+  いた）。
+- `shared_mapping_t` に `size` を持たせ、`munmap(2)` は**範囲と交差する
+  全マッピング**を解放する `shared_memory_unmap_range()` を使う。従来は
+  開始アドレスが一致する 1 個だけを探していたため、隣接領域をまとめて
+  解放するアロケータで古いマッピングが残り、次の確保とページテーブルを
+  奪い合っていた。`shmdt(2)` は長さ 0 で従来どおり完全一致。
+- `SHARED_MEMORY_OBJECT_MAX` を 256 → 1024、ハンドルのインデックスを
+  8 → 10 ビットに拡張（YouTube 1 タブで 256 を超える）。
+
+### 15.2 SysV 共有メモリ（MIT-SHM）が無かった
+
+`shmget`/`shmat`/`shmdt`/`shmctl` は Linux ABI で `ENOSYS` を返していた。
+Chromium は MIT-SHM を諦めて全ウィンドウの `XPutImage` コピーに落ちる。
+`Kernel/Source/Compat/Linux/SysvShm.{c,h}` を追加した。実装で重要だった点:
+
+- **`IPC_RMID` は「削除予約」**。Linux はアタッチが残っている間、ID 表に
+  セグメントを残し、`shmat()` も成功する。Xlib の `XShmAttach()` は
+  クライアント側で `shmat` → `IPC_RMID` を先に行い、その後に X サーバが
+  `shmat` する。当初は `IPC_RMID` で表エントリを即座に消していたため、
+  サーバの `shmat` が `EIDRM` で失敗し、MIT-SHM は成立していなかった。
+  アタッチ表（pid / shmid / アドレス）を持ち、最後の `shmdt()` で回収する。
+- プロセス終了・`execve` では、その pid のアタッチを落として `nattch` を
+  減らす。セグメント自体は `IPC_RMID` されるまで存続する（Linux と同じ）。
+  作成プロセスの終了で消していたため、サーバが `shmid` を受け取った直後に
+  セグメントが消える競合もあった。
+- `shared_memory_cleanup_process()` は public オブジェクトの作成参照を
+  落とさない（tmpfs / memfd / SysV の公開オブジェクトは発行側が保持する）。
+
+### 15.3 その他
+
+- `vfs_mount()` は `vfs_driver_t` を**コピー**して保持するので、
+  `file->fs_driver` をグローバルなドライバ構造体のアドレスと比較しては
+  いけない。tmpfs の判定は `share_map` のフック関数ポインタで行う。
+- Chromium の `--ignore-gpu-blocklist` は §13.2 のとおり条件付きにした。
+
+### 15.4 検証（KVM, `-smp 4 -m 8192`, llvmpipe）
+
+- `test-shmattach.iso`（`Build/x86_64/ISO_ROOT` から作成、起動 URL は
+  `https://www.youtube.com/watch?v=jNQXAC9IVRw`）で、
+  `[sysvshm] shmget-create → shmat（クライアント）→ shmctl-rmid →
+  shmat（X サーバ）` を確認。MIT-SHM が実際に成立している。
+- ページフォルト 0 件（起動後 3 分以上、動画再生中）。以前はブラウザ起動
+  約 20 秒で `CR2=RIP=0x4246`、続いて Xorg が `0x40` への書き込みで落ちた。
+- 初回ロード: DOMContentLoaded 約 21 秒、load 約 27 秒（シリアルログを
+  増やさない構成）。`--enable-logging=stderr --v=0` を付けると 45 秒まで
+  伸びる（115200 baud のシリアルがボトルネック）。
+- 再生: 854x480 VP9（`VpxVideoDecoder`、ソフトウェア）が約 30 fps、
+  `requestAnimationFrame` は 38〜51 fps、`droppedVideoFrames` は約 6%。
+- 残り: `munmap(2)` で SysV セグメントを外した場合（`shmdt` を使わない
+  クライアント）はアタッチ表が残る。Xlib は `shmdt` を使うので実害は無い。
+  テスト用の `launch.args`（CDP ポート）は ISO にだけ置き、ツリーには
+  入れていない。
 
 ---
 
