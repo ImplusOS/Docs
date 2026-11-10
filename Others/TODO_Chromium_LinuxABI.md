@@ -985,6 +985,10 @@ try restarting your device.」で止まっていた。原因は 2 つで、ど�
   奪い合っていた。`shmdt(2)` は長さ 0 で従来どおり完全一致。
 - `SHARED_MEMORY_OBJECT_MAX` を 256 → 1024、ハンドルのインデックスを
   8 → 10 ビットに拡張（YouTube 1 タブで 256 を超える）。
+- `process_user_free()` / `process_user_munmap()` は、**ページを外し終えて
+  から**スロットの `used` を落とす。先に落とすと別スレッドの
+  `process_user_alloc()` が同じスロットを再利用して新しいマッピングを張り、
+  遅れて走ったアンマップがそれを消してしまう。
 
 ### 15.2 SysV 共有メモリ（MIT-SHM）が無かった
 
@@ -1023,8 +1027,10 @@ Chromium は MIT-SHM を諦めて全ウィンドウの `XPutImage` コピーに�
 - 初回ロード: DOMContentLoaded 約 21 秒、load 約 27 秒（シリアルログを
   増やさない構成）。`--enable-logging=stderr --v=0` を付けると 45 秒まで
   伸びる（115200 baud のシリアルがボトルネック）。
-- 再生: 854x480 VP9（`VpxVideoDecoder`、ソフトウェア）が約 30 fps、
-  `requestAnimationFrame` は 38〜51 fps、`droppedVideoFrames` は約 6%。
+- 再生: 854x480 VP9（`VpxVideoDecoder`、ソフトウェア）が約 25〜30 fps、
+  `requestAnimationFrame` は 38〜54 fps。ページが落ち着いてからの 10 秒窓で
+  `droppedVideoFrames` は 2/251（約 0.8%）。読み込み直後は広告・同意画面の
+  有無で最初の数十秒が揺れる（OS 側の問題ではない）。
 - 残り: `munmap(2)` で SysV セグメントを外した場合（`shmdt` を使わない
   クライアント）はアタッチ表が残る。Xlib は `shmdt` を使うので実害は無い。
   テスト用の `launch.args`（CDP ポート）は ISO にだけ置き、ツリーには
