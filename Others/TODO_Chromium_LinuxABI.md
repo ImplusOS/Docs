@@ -1038,6 +1038,72 @@ Chromium は MIT-SHM を諦めて全ウィンドウの `XPutImage` コピーに�
 
 ---
 
+## 16. virgl — Chromium が実際にホスト GPU で描画する (2026-11-13)
+
+§13.2/§14.5 の時点では `--ignore-gpu-blocklist` を付けても実体は llvmpipe
+だった。今回、QEMU `virtio-gpu-gl-pci` + ホスト GPU（WSLg 上の
+D3D12 / RTX 2060）で、Chromium の WebGL が
+
+```
+UNMASKED_RENDERER=ANGLE (Mesa, virgl (D3D12 (NVIDIA GeForce RTX 2060)), OpenGL 4.2)
+```
+
+を報告し、Xorg も `glamor X acceleration enabled on virgl (...)` で上がる
+ところまで通した。ブラウザ UI・ページ・WebGL がすべてホスト GPU 経由で描画される。
+起動は `make run_uefi_cdrom QEMU_GPU=virgl`。
+
+### 16.1 ホスト側: §14.5 の「virgl を試せない」は egl-headless 固有だった
+
+`egl-headless` はホストの DRM レンダノードを要求するが、`-display sdl,gl=es`
+は WSLg の X/Wayland 上で GLES コンテキストを作れる。`sdl,gl=on`（デスクトップ
+GL 3.0+）は作れず、`gtk,gl=on` は virgl のスキャンアウトを表示した瞬間に
+`eglMakeCurrent failed: EGL_BAD_ACCESS` で QEMU ごと abort する。
+GL スキャンアウトは `screendump` できない（`no surface`）ので、検証は
+ホスト側で `import -window <QEMU の X ウィンドウ>` で撮った。
+
+### 16.2 なぜ Chromium が virgl に届いていなかったか
+
+Mesa の X11 プラットフォームは GPU の fd を **DRI3Open** でしか得ない。
+DRI3 は Xorg の glamor が提供し、glamor は `drmGetDeviceNameFromFd2(card0)`
+を開いてクライアントに渡す。つまり **card0 が virgl を話さない限り
+クライアントは GPU に届かない**。ところが card0 は `kms_swrast` を名乗る
+ダムバッファ専用シムで、Xorg の環境も llvmpipe 固定だった。
+
+### 16.3 直したこと
+
+| # | 内容 | 場所 |
+|---|---|---|
+| 1 | 3D バックエンドがあるとき card0 は `virtio_gpu` を名乗り、GEM/PRIME/`DRM_VIRTGPU_*`（0x40..0x9F のみ。0xA0 以上は KMS）と mmap をレンダセッションへ転送。KMS（ADDFB/flip/DIRTYFB）は virgl BO を受け付け、WM ウィンドウへ写す前に `TRANSFER_FROM_HOST_3D` で読み戻す | `DRM_Kms.c` |
+| 2 | sysfs の card0 も virtio-gpu の PCI 識別子で公開（Mesa はこれでドライバを選ぶ） | `SysFS.c` |
+| 3 | **レンダセッションをプロセス単位からオープンファイル単位へ**（Linux の `drm_file`）。Mesa は pipe screen ごとに fd を持ち `CONTEXT_INIT` するので、プロセス単位では 2 つ目が `EEXIST` になり `glx: failed to create dri3 screen` → llvmpipe に落ちていた。スロットは DevFS の `driver_data` に載り、fd とともに DRI3 で渡る | `DRM_Kms.c`, `DevFS.c` |
+| 4 | `RESOURCE_CREATE` が `target == 0` を拒否していた。0 は `PIPE_BUFFER`（頂点/ユニフォーム等、最頻）で、glamor の `glBufferData` が `GL_OUT_OF_MEMORY` で落ちていた | `DRM_Kms.c`, `VirtIO.c` |
+| 5 | VirtIO ドライバの表示系（`set_mode`、毎フレーム呼ばれる `poll_config` の `GET_DISPLAY_INFO`、EDID、モニタ資源の作成/破棄）が **制御キューをロックなしで叩いていた**。3D コマンドと他 CPU で交錯し、応答の取り違え・リソース ID の二重払い出し（ホスト側 `ctrl 0x204, error 0x1203`）・`INVALID_CONTEXT_ID` が出ていた | `VirtIO.c` |
+| 6 | PRIME で取り込んだ BO に `RESOURCE_INFO` が `EINVAL` を返していた（id は dma-buf ブロック側にある）。同じ dma-buf の再インポートは同じハンドルを返す（Linux と同じ） | `DRM_Kms.c` |
+| 7 | `DRM_CAP_PRIME` を import のみ(1)→ import\|export(3) | `DRM_Kms.c` |
+| 8 | `WAIT_VBLANK`（0x3A）を最小実装（60 Hz の仮想 vblank、イベントは即時配送）。glamor + Present では毎フレーム呼ばれ、未実装ログ 1.5 万行が 115200bps のシリアルを詰まらせていた | `DRM_Kms.c` |
+| 9 | Xorg の `LIBGL_ALWAYS_SOFTWARE`/`kms_swrast` 強制は 3D が無いときだけ | `LinuxEnv.c` |
+| 10 | 制御キューの失敗（タイムアウト・ホストのエラー応答）を `g_vlog_budget` と無関係に記録（上限 64 行） | `VirtIO.c` |
+
+### 16.4 計測（KVM, `-smp 4 -m 8192`, WSLg / RTX 2060）
+
+- requestAnimationFrame + WebGL clear: 初回ロード直後 1.8 fps（D3D12 経由の
+  シェーダコンパイル）、リロード後の定常 **20.2 fps**。
+- 3 秒窓の内訳: Xorg の DIRTYFB 81 回（約 27 Hz）、`EXECBUFFER` 約 3.8 ms/回、
+  読み戻し約 4〜6 ms/回。すべて同期実行。
+- 3D なし（VGA のみ）の経路は従来どおり glamor on llvmpipe で描画する（回帰なし）。
+
+### 16.5 残り
+
+- `EXECBUFFER`/転送は制御キュー上で**同期**（割り込み禁止のままホスト完了を待つ）。
+  fence（`VIRTGPU_EXECBUF_FENCE_FD_OUT`、sync_file）と非同期完了を入れれば
+  フレームレートはまだ上がる。DRM バージョンは 0.0 のまま（Mesa に fence を使わせない）。
+- フリップ/vblank は仮想。Present のイベントは即時に返す。
+- `RESOURCE_CREATE_BLOB` / host-visible メモリは未対応（`VIRTGPU_PARAM_RESOURCE_BLOB=0`）。
+- 制御キューのタイムアウトは 1 秒固定。重いシェーダのコンパイルで超えると
+  そのコマンドは失敗扱いになる（16.3 #10 のログで分かる）。
+
+---
+
 ## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
 
 `-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では
