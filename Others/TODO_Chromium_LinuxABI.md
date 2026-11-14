@@ -1104,6 +1104,160 @@ DRI3 は Xorg の glamor が提供し、glamor は `drmGetDeviceNameFromFd2(card
 
 ---
 
+## 17. GPU フェンスと非同期実行、vblank の完全対応 (2026-11-13)
+
+§16.5 の残り 2 つ（「すべて同期」「vblank は仮想・即時」）を実装した。
+
+### 17.1 フェンスと非同期化
+
+**VirtIO ドライバ（`VirtIO.c`）**
+
+- 制御キューを「同期用 1 スロット（記述子 0/1）＋非同期 64 スロット（2+2i / 3+2i）」に
+  再構成。used リングは **head id で照合**する（フェンス付き要求は後続の同期要求より
+  後に返ってくるため、「次に返ってきたもの＝自分」は成り立たない）。
+- `SUBMIT_3D` と `TRANSFER_{TO,FROM}_HOST_3D` は `VIRTIO_GPU_FLAG_FENCE` と単調増加の
+  fence id を付けて**投げっぱなし**。ペイロードは 4 MiB の DMA リングに置き、完了順に解放。
+  QEMU はフェンスがホスト GPU で retire した時点で応答を返す。
+- `virtio_gpu_fence_completed()` は「これ以下は全部完了」の fence id を返す
+  （try-lock で used リングを回収するのでタイマ割り込みからも呼べる）。
+  `driver_display_t` に `gpu_submit_3d_async` / `gpu_transfer_3d_async` /
+  `gpu_fence_completed` を追加（NULL なら従来の同期経路）。
+- デバイスの再初期化（リセット）では発行済みフェンスを全部完了扱いにする。
+
+**DRM（`DRM_Kms.c`）**
+
+- BO ごとに「最後にそれを使ったコマンドのフェンス」を記録（PRIME ブロックにも伝播し、
+  インポート側のハンドルからも見える）。`EXECBUFFER` は `bo_handles` 全部に、転送は対象 BO に付ける。
+- `DRM_VIRTGPU_WAIT`: 完了済みなら 0、未完了なら `NOWAIT` は `-EBUSY`
+  （Mesa のバッファキャッシュの busy 判定）、通常は**ブロック**。
+- カーネルは syscall 中で眠れないので、`DRM_WOULD_BLOCK`(-513) を返し、Linux ABI 層が
+  `poll_wait_park()` で待って同じ ioctl を再実行する（ALSA と同じ方式）。起床は
+  `drm_timer_tick()`（250 Hz のタイマ割り込みから）が retire したフェンスの前進を見て
+  `poll_wait_notify()` する。
+- バッキングページの解放は従来どおり同期の `DETACH_BACKING` 完了後。QEMU は制御キューを
+  順に処理するので、それより前の非同期転送は処理済み。
+
+### 17.2 vblank
+
+- CRTC ごとに仮想スキャンアウトの時間軸を持つ。周期はモードの `clock / (htotal * vtotal)`
+  から求める（ユーザ空間が計算する値と一致）。モード変更時は (base_seq, base_ns) を
+  再設定してカウンタの単調性を保つ。タイムスタンプは `CLOCK_MONOTONIC`。
+- モードの `clock` を表示サイズではなく total から計算するよう修正。従来は 1024x680 で
+  57.5 Hz になっていた（Chromium のフレームレートが 28.75 fps 付近で頭打ちになる原因）。今は 60 Hz。
+- `WAIT_VBLANK`: 相対/絶対/`NEXTONMISS`、イベントなしは対象 vblank まで**ブロック**
+  （再実行に備え、Linux と同じく要求を絶対値に書き換えてから待つ）。
+  `_DRM_VBLANK_EVENT` は対象 vblank を過ぎた時点で、その vblank の番号と時刻で配送。
+- `CRTC_GET_SEQUENCE` / `CRTC_QUEUE_SEQUENCE`（イベント `DRM_EVENT_CRTC_SEQUENCE`）を実装。
+  modesetting DDX はこちらを優先して使う。`MODESET_CTL` は 0。`DRM_CAP_VBLANK_HIGH_CRTC=1`。
+- ページフリップ／atomic の完了イベントは**次の vblank**で配送。完了前の再フリップは
+  `-EBUSY`（実機と同じ）。
+- 配送は read()/poll() 時に期限到来分を読み出しキューへ移す方式。待っている poller は
+  `drm_timer_tick()` が最も早い期限（`g_vbl_next_due_ns`）で起こす。
+
+### 17.3 検証（KVM, `-smp 4`, WSLg / RTX 2060, `QEMU_GPU=virgl`）
+
+静的リンクのテストプログラムで ioctl を直接叩いた（ツリーには入れていない）:
+
+| 項目 | 結果 |
+|---|---|
+| `CRTC_GET_SEQUENCE` のレート | 58.9〜59.7 Hz（0.5 秒の計測窓） |
+| 相対 1 の `WAIT_VBLANK` ×60 | 986.9 ms、タイムスタンプ間隔 16.666〜16.667 ms |
+| `NEXTONMISS` / 過去の絶対値 | 次の vblank まで待つ / 即時に返る |
+| イベント（相対 3） | 番号・user_data 一致、早すぎる配送なし、vblank の 1〜3.4 ms 後に配送 |
+| `CRTC_QUEUE_SEQUENCE`（相対 5） | 番号・user_data 一致 |
+| フェンス（1 MiB バッファの往復転送 ×50） | 発行直後の `NOWAIT` で 37/50 が busy、ブロッキング待ち 50/50 成功（平均 3.8 ms、最大 15 ms） |
+
+- Xorg と Chromium の起動と同時に走らせた回では、相対 1 の待ちが 1 回だけ 33 ms 後に返った
+  （プロセスが 1 フレーム以上スケジュールされなかった）。戻り値は Linux と同じく「戻った時点の
+  vblank 番号」なので仕様どおり。単独で走らせた回は 0 回。
+- Chromium の WebGL rAF（定常、リロード後）: 同期版の約 20 fps から 16〜30 fps
+  （WSL ホストでのばらつき大）。Mesa 側のフェンス待ちは Chromium ではほぼ発生せず
+  （`NOWAIT` で busy を見てバッファを使い回している）、Xorg の Present は vblank に同期している。
+- 3D なし（VGA のみ）の経路は回帰なし（glamor on llvmpipe、Chromium 描画）。
+
+### 17.4 残り
+
+- KMS の読み戻し（DIRTYFB/フリップ時の `TRANSFER_FROM_HOST`）はまだ同期。1 フレーム遅らせて
+  非同期にすれば Xorg の 1 フレームあたり数 ms が消える。
+- sync_file（`VIRTGPU_EXECBUF_FENCE_FD_IN/OUT`、DRM バージョン 0.1）は未実装。Mesa は
+  0.0 のとき BO 待ちでフェンスを作るのでそれで足りているが、`EGL_ANDROID_native_fence_sync`
+  は出ない。
+- 待ちの起床精度はタイマ tick（4 ms）と park（最大 2 ms）で決まる。イベント配送は
+  vblank の最大 ~4 ms 後。
+- QEMU 側のフェンス retire は QEMU 自身のポーリングに依存する（ホスト側の挙動）。
+
+---
+
+## 18. §17.4 の残りの解消 — 非同期読み戻し・sync_file・高精度な起床 (2026-11-13)
+
+### 18.1 KMS 読み戻しの非同期化（`DRM_Kms.c`）
+
+DIRTYFB／フリップで WM ウィンドウへ写すとき、virgl のフレームバッファは
+フェンス付きの `TRANSFER_FROM_HOST_3D` を発行するだけで返る（`rb_cur`）。
+完了後のコピーは、毎フレーム呼ばれるランチャの `drm_kms_mirror_take_dirty()`
+（XSession のループ）か、X サーバの次の KMS 呼び出しで行う。転送中に次のフレームが
+来たら `rb_next` に記録し、完了時に再発行する（途中のフレームは捨てる）。コピー時は
+バッファをハンドルと resource id で引き直すので、解放・再利用されたバッファは読まない。
+パネル直描き（ミラーなし）は消費者がいないので従来どおり同期。
+
+### 18.2 sync_file（フェンス fd）
+
+- DevFS に `DEVFS_KIND_DRM_SYNC`（パスなしのオブジェクト、PRIME と同じ作り）。
+  poll は `POLLIN` = フェンス retire 済み、ioctl は `SYNC_IOC_MERGE` / `SYNC_IOC_FILE_INFO`。
+  フェンスは単一の順序付きタイムラインなので、マージは新しい方のフェンス。
+- `EXECBUFFER` の `VIRTGPU_EXECBUF_FENCE_FD_OUT` / `FENCE_FD_IN` に対応。IN は
+  このデバイスのフェンスであることを検証するだけ（同じ順序付きキューなので待つ必要がない）。
+- dma-buf: `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` / `IMPORT_SYNC_FILE`、poll は暗黙フェンスを待つ。
+- 引数構造体の中の fd（`fence_fd`、`fd2`/`fence`、dma-buf の `fd`）は Linux ABI 層
+  （`lx_ioctl_fence_fds()`）がプロセスごとの番号とグローバル番号の間で変換し、
+  出力は `O_CLOEXEC` で登録する（PRIME と同じ理由: しないと close() が EBADF になる）。
+- 以上がそろったので DRM バージョンを **0.1** にした（3D バックエンドがあるとき）。
+  Mesa の virgl はこれでフェンス fd を使う。
+
+### 18.3 起床精度
+
+- **フェンス**: virtio-gpu の制御キューに MSI-X を 1 本割り当て（`vgpu_setup_msix()`）、
+  割り込みハンドラで used リングを回収し、retire したフェンスが進んだらカーネルの
+  `poll_wait_notify()` を呼ぶ（`gpu_set_fence_callback`）。MSI-X が無ければ従来の
+  ポーリング（ドライバ呼び出し時と 250 Hz tick）。
+- **vblank**: BSP（CPU0）の LAPIC タイマを one-shot に切り替え、毎回
+  「次の定期 tick」と「最も早い vblank 期限」の早い方で再設定する。定期 tick は
+  `timer_monotonic_ns()` 上の予定時刻で刻むので、g_ticks の周期・スケジューラの
+  タイムスライスは変わらない（早期割り込みは tick を数えない）。他の CPU が CPU0 の
+  設定済み時刻より早い期限を登録したときは CPU0 にタイマベクタの IPI を送って再設定させる。
+  AP は従来どおり periodic。HPET 較正が無い経路と arm64 は従来の tick 精度
+  （`timer_hal_t.hires_request` が NULL）。
+
+### 18.4 計測（KVM, `-smp 4`, WSLg / RTX 2060）
+
+静的リンクのテストプログラム（ツリー外）で、同じコードの「高精度タイマ＋MSI-X 有効（A）」と
+「無効（B）」を比べた。この環境（WSL2 上の入れ子 KVM）は VM 全体が数十〜数百 ms 止まる
+ことがあり（§13.6）、最大値はそれに支配されるので中央値で見る。
+
+| 指標 | A | B |
+|---|---|---|
+| 高精度タイマの発火（期限からの遅れ、カーネル内計測） | 平均 0.12 ms | —（tick: 0〜4 ms） |
+| ブロッキング `WAIT_VBLANK` の戻り p50 | 0.27〜1.9 ms | 2.0 ms |
+| vblank イベント配送 p50 | 0.46〜2.6 ms | 4.7 ms |
+| フェンス待ち（`VIRTGPU_WAIT`）p50 | 0.01〜3.3 ms | 7.0 ms |
+| sync_file が signal されるまで | 0.46 ms | 7.1 ms |
+
+- sync_file の各経路（FENCE_FD_OUT/IN、poll、FILE_INFO、MERGE、dma-buf EXPORT）はテストで確認。
+- Chromium（WebGL rAF、virgl）: 初回ロード直後から 32〜33 fps、リロード後の定常
+  31〜33 fps（§17 時点 16〜30 fps、同期版 約 20 fps）。エラー・未対応 ioctl 0 件。
+- GPU なし（VGA のみ）の構成でも、one-shot タイマ下で Xorg（llvmpipe）と Chromium が従来どおり動作。
+
+### 18.5 残り（このゲストからは解決しないもの）
+
+- QEMU 側のフェンス retire のタイミングはホスト（QEMU/virglrenderer）の実装次第。
+  上の計測ではフェンス待ちの中央値は数 ms 以下で、ゲストの待ち方は律速になっていない。
+- 割り込みから待ち手が実際に走るまでの時間（IPI・HLT 復帰）は入れ子 KVM では 0.3〜2 ms
+  かかり、裾は VM 全体の停止に引きずられる。
+- 30 fps 付近で止まるのは、1 フレームの処理（Chromium の合成＋Xorg glamor＋読み戻し）が
+  1 vblank 周期（16.7 ms）を超えて 2 周期に 1 回の表示になるため（正しい vblank 同期の結果）。
+
+---
+
 ## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
 
 `-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では
