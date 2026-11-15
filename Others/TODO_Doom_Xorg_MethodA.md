@@ -70,8 +70,9 @@ Doom はただの GLX クライアントとして起動する。
 > カーネル `ProcessManager_Create.c` の既定 envp は POSIX 汎用（`PATH` `HOME`
 > `TERM` `SHELL` `LANG` `TZ` `XDG_*` …）と glibc 家族の `LD_LIBRARY_PATH` のみ。
 > env を渡すのは新しい `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）で、Doom は
-> `xsession_run_env()` + `linux_env_add_x11()` / `linux_env_add_doom()` で組み立てる。
-> 以下の記述の `glibc_envp` は旧称＝現 `linux_env_add_*()`（`Userland/API/Source/LinuxEnv.c`）。
+> `xsession_run()` がプログラムプロファイル `linuxxdoom-x86_64.env` と役割プロファイル
+> `x11-client.env` を読み込んで組み立てる（`/etc/ImplusOS/linux-env/`、ローダーは
+> `Userland/API/Source/LinuxEnv.c`）。以下の記述の `glibc_envp` は旧称＝現在の `.env` ファイル群。
 
 検証:
 ```
@@ -677,9 +678,10 @@ Reading screen...
 | `Userland/Application/Doom/Start.c` | 誤ったコメントを訂正（envp はカーネル側 `glibc_envp` が組み立てる旨も明記） |
 
 ※現状（2026-09-29）: `glibc_envp` は汎用既定のみに縮小し、`DISPLAY=:0` は
-`Userland/API/Source/LinuxEnv.c` の `linux_env_add_x11()` が提供する。
-`Doom/Start.c` は `xsession_run_env()` で `linux_env_add_x11()` +
-`linux_env_add_doom()` を `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）として渡す。
+役割プロファイル `Userland/API/Environment/x11-client.env` が提供する。
+`Doom/Start.c` は `xsession_run()` を呼ぶだけで、XSession がそれと
+`Userland/Application/Doom/Environment/linuxxdoom-x86_64.env` を読み込み、
+`SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）として渡す。
 
 ### 次ブートで見るもの
 

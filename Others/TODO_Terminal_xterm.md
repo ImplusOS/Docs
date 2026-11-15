@@ -143,8 +143,8 @@ $S/lib64/ld-linux-x86-64.so.2 --library-path $S/usr/lib/x86_64-linux-gnu \
     "No absolute path found for shell" で終了する）、`TERM=xterm` は POSIX
     汎用なので**カーネル側の既定 envp**（`Kernel/Core/process/ProcessManager_Create.c`）に残置。
   - `XFILESEARCHPATH`（Xt の app-defaults 探索先）はアプリケーション固有なので
-    ユーザランドの `Userland/API/Source/LinuxEnv.c`
-    （`linux_env_add_x11()` → `xsession_run()` が自動付与）へ移した。
+    ユーザランドの役割プロファイル `Userland/API/Environment/x11-client.env`
+    （`xsession_run()` が自動で読み込む）へ移した。
     ランチャーから env を渡すには `SYSCALL_PROCESS_SPAWN_ELF_ENV`（277）を使う。
 
 ---

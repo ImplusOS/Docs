@@ -62,8 +62,7 @@ The userland exposes typed C wrapper functions for each syscall category:
 | `WM_Protocol.h` | WM Protocol | Window manager message definitions |
 
 Helper libraries also live under `Userland/API/`: `FreeType.c/.h` (font
-rendering), `Jpeg.c/.h` (libjpeg wrapper), `Zlib.h` (zlib wrapper) and
-`XMLParser.c/.h` (UI-layout parser).
+rendering), `UI.c/.h` (widget toolkit) and `Theme.c/.h` (desktop theme).
 
 ### Syscall Mechanism (x86_64)
 
@@ -185,74 +184,45 @@ include `Userland/Service/Common.mk`.
   focused window over IPC.
 - Renders via direct framebuffer access.
 
-#### Design system (`Userland/API/Source/Material.[ch]`, `Theme/WM_Theme.c`)
+#### Theme (`Userland/API/Source/Theme.[ch]`, `Theme/WM_Theme.c`)
 
-The shell is drawn entirely in **Material Design 3** tokens. Nothing in the
-window manager names a colour directly; every surface, outline and piece of
-text names an M3 role, so the whole desktop is retinted by changing one
-value.
+The shell, the login screen and every application draw with one shared
+palette, `theme_t`: a fixed set of light or dark neutrals (`bg`, `surface`,
+`surface_alt`, `border`, `text`, `text_dim`, `danger`) plus one **accent**
+colour and the two colours derived from it (`on_accent`, `accent_soft`).
+`theme_init(&t, accent, dark)` builds it; `Theme.h` also fixes the font
+sizes (`THEME_FONT_SMALL` 12 / `BODY` 14 / `LARGE` 16 / `TITLE` 22), the
+corner radii and the hover / disabled opacities, and provides
+`color_mix()` / `color_alpha()`.
 
-- **Colour.** One seed colour expands into five tonal palettes (primary,
-  secondary, tertiary, neutral, neutral-variant) plus M3's fixed error
-  palette, which `m3_scheme_init()` maps onto the standard role names
-  (`primary`, `on_primary_container`, `surface_container_high`,
-  `outline_variant`, ...) for either the light or the dark scheme. Tones are
-  produced in CIE LCh(ab) -- hue and chroma held, chroma reduced until the
-  tone is inside sRGB -- which lands within a few code points of M3's
-  published baseline palettes; `Tests/MaterialTest.c` checks that against
-  the specification. The default seed is M3's own baseline, `#6750A4`.
-- **Shape.** The M3 shape scale (`WM_M3_SHAPE_EXTRA_SMALL` 4 through
-  `EXTRA_LARGE` 28, plus `FULL` for a stadium), resolved against each
-  component's box by `m3_shape_radius()`.
-- **Elevation.** Levels 0-5. In the light scheme a level tints its container
-  toward `surface_tint`; in the dark scheme the surface-container tones
-  carry it instead, as M3 specifies. Every raised surface draws its key
-  light through `wm_canvas_elevation_shadow()`, so a level looks the same
-  height wherever it appears.
-- **State layers.** Hover 8%, focus 10%, pressed 10%, dragged 16% of the
-  "on" colour over the component's own container (`m3_state_layer()`).
-- **Type.** The M3 type scale in pixels (`title_large`, `body_medium`,
-  `label_small`, ...), with a theme-wide multiplier.
-- **Motion.** M3's emphasized-decelerate curve on the way in and
-  emphasized-accelerate on the way out, with the M3 duration tokens
-  (`m3_ease()`, `M3_DURATION_*`).
+Theme files hold `accent = #RRGGBB` and `mode = light|dark`; the window
+manager's copy also has a `[Metrics]` section (title bar height, window
+corner radius, shadow spread, taskbar height). The shipped
+`Resource/Themes/Default.theme` is read first and `/var/System/shell.theme`
+(written by `com.ImplusOS.settings`) is applied on top of it -- by the window
+manager and by `theme_load_desktop()` alike. Settings also sends
+`WM_SET_THEME` (`window_set_theme(accent, dark)`), which the shell applies at
+once; applications pick the change up the next time they start.
 
-Themes are `.theme` files (`Resource/Themes/Material.theme`,
-`Material-Dark.theme`). A theme names a `seed`, a `mode` (`light`/`dark`), a
-`type_scale` and the four metrics that are the shell's own -- title bar
-height, window corner radius, shadow spread, taskbar height -- and may
-override individual colour roles by their M3 name. The window manager reads
-`/var/System/shell.theme` first, then the shipped light theme; failing both
-it keeps the baseline defaults. The `WM_SET_THEME` IPC message re-seeds the
-scheme from the accent colour it carries.
+#### Applications and UI
 
-The token module is shared, not the shell's own: the login screen and every
-application built on ImUI generate the same scheme from the same theme file
-(`m3_load_desktop_theme()`, `MaterialTheme.c`). The shell applies a new seed
-at once, over the `WM_SET_THEME` message; applications pick it up the next
-time they start. `com.ImplusOS.settings` is what sends both.
-
-`AppUITheme.h` holds the same roles as compile-time constants, frozen at the
-baseline seed, for a program that wants to match the shell without linking
-the palette generator.
-
-#### Applications and ImUI
-
-First-party applications are built on **ImUI** (`Userland/API/Source/ImUI.[ch]`),
-a small retained-mode toolkit whose every widget is a Material Design 3
-component drawn from the tokens above: text/filled/tonal/outlined buttons
-(`imui_set_variant()`), filled text fields, navigation-drawer-style list
-items, outlined cards, filled toolbars and the M3 type scale
-(`imui_set_type_role()`). The scheme comes from the desktop's theme file at
-startup, so an app follows a retint without knowing about it.
+First-party applications are built on **UI** (`Userland/API/Source/UI.[ch]`),
+a small widget toolkit: one window per process (`ui_create()`, `ui_run()`),
+row/column containers with flex `grow`, toolbar strips (`ui_bar()`), labels
+(`ui_label()` / `ui_title()` / `ui_caption()`), buttons (text and/or icon;
+`primary` for the accent-coloured one), single- and multi-line text fields,
+lists of `{icon, text, subtext}` rows, and a canvas the app paints itself
+(`ui_draw_*()`) for anything the stock widgets do not cover. Callbacks take
+just the widget (`on_action` for click / activate / Enter, `on_change` for
+edits); widget fields are public and set directly.
 
 | Application | What it is |
 |---|---|
 | `com.ImplusOS.editor` | text editor |
 | `com.ImplusOS.filemanager` | file browser |
 | `com.ImplusOS.serialmonitor` | COM1 debug log viewer |
-| `com.ImplusOS.settings` | desktop colour scheme (seed + light/dark), CPU/memory/graphics, devices, disks |
-| `com.ImplusOS.processmanager` | running processes with live CPU share and memory, and a way to end one |
+| `com.ImplusOS.settings` | desktop theme (accent colour + light/dark), CPU/memory/graphics, devices, disks |
+| `com.ImplusOS.taskmanager` | Windows-style task manager: process table (apps / background, heat-shaded CPU / memory / display columns, sort, search, end task, priority), 60 s CPU / per-core / memory / display-transfer graphs, disk capacity, kernel boot-phase timeline, per-process details. Drawn on a UI canvas |
 
 #### Application list (`Linux/WM_DesktopEntry.c`)
 
@@ -345,11 +315,6 @@ rather than an X server.
   and supplied at build time.
 
 ## 7. Utility Libraries
-
-### XML Parser (`Userland/API/XMLParser.c`)
-
-Simple XML parser for UI layout files, used by apps that load `layout.xml`
-resources.
 
 ### DNS Resolver (`Userland/Service/com.ImplusOS.netstack/DNS/DNS.c`)
 

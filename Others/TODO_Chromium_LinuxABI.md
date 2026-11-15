@@ -1258,6 +1258,51 @@ DIRTYFB／フリップで WM ウィンドウへ写すとき、virgl のフレー
 
 ---
 
+## 19. chrome://gpu が「Software only」になる — accept() 後の SCM_RIGHTS 位置ずれ (2026-11-15)
+
+**症状**: chrome://gpu の「Graphics Feature Status for Hardware GPU」は Hardware accelerated
+なのに、「Graphics Feature Status」は Software only。GPU プロセスが 3 回落ちて
+SwiftShader にフォールバックした状態。起動ごとに起きたり起きなかったりし、起きた回は
+GPU プロセスを何度作り直しても毎回落ちる（同じ Xorg に対しては決定的）。
+
+**ログ上の流れ**（GPU プロセス）:
+
+1. `MESA: error: dri3_get_pixmap_buffer ... xcb_dri3_fence_from_fd failed` / `X error: 2`
+   （Xorg が FenceFromFD の fd を受け取っていない＝BadValue）、続いて
+   `xcb_dri3_pixmap_from_buffer[s] failed` / `X error: 11`（ずれた fd を dma-buf として
+   import して BadAlloc）。
+2. Mesa のエラーパスが未初期化の fd 配列を close し、fd 0 を閉じる。
+3. `GBMSupportX11` の DRI3Open の応答 fd がその空いた 0 に入り、Chromium の
+   `ScopedFD` 所有権チェック（`Crashing due to FD ownership violation`）で自殺する。
+   exit_code=48896。
+
+**原因**（`Kernel/Source/IPC/UnixSocket.c`）: 2026-11-14 の wineserver 対応でストリームの
+SCM_RIGHTS をバイト位置（`usock_passed.at` = 送信時の `in_pos`）に結び付けた。accept()
+前にクライアントが書いたバイトはリスナのリングに入るが、リスナは読まないので
+`out_pos` は 0 のまま、`in_pos` だけが「accept 前に書いた全クライアントのバイト数」だけ
+進む。`unix_socket_accept()` はこの 2 つをそのまま新しいエンドポイントにコピーしていたので、
+**別のクライアントが accept 前に書いた後に accept された接続**は `out_pos` が `in_pos` より
+その分だけ遅れて始まる。`usock_dequeue()` は `out_pos` が `at` に届くまで fd を渡さないので、
+その接続でクライアントから送った fd はすべて「その分のバイト」だけ遅れて届く
+（要求本体より後）。X クライアントは接続直後に 12 バイトのセットアップ要求を書くので、
+Xorg の accept が遅れた接続が 1 本でもあれば、以後の接続の DRI3 がすべて壊れる。
+
+**修正**: accept 時に新エンドポイントの窓を「引き継ぐバイトそのもの」にする
+（`out_pos = リスナの in_pos − リング内の未読バイト数`、`in_pos = out_pos + 移したバイト数`）。
+リスナの `out_pos` も移した分だけ進める。
+
+**確認**（KVM `-smp 4`, `QEMU_GPU=virgl`）: 修正前はデバッグ計装つきで 1 起動 / 約 3 起動中
+（ランチャを重ねて Xorg を増やす手順）で再現。修正後は 4 起動 × 最大 6 回の起動で
+MESA エラー・GPU プロセス終了とも 0、chrome://gpu は Hardware accelerated。
+旧コードなら位置ずれになっていた accept（accept 前に 12/24 バイト書かれていた接続）は
+各起動で 1〜3 回起きていた。
+
+**残り**: accept 前に複数のクライアントが書くと、それぞれのバイトが同じリスナのリングに
+混ざり、最初に accept された接続へまとめて移る（ログ上 `moved=24` ＝ 2 クライアント分）。
+X のセットアップ要求が別の接続に届くことになるので、本来はクライアントごとに分ける必要がある。
+
+---
+
 ## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
 
 `-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では

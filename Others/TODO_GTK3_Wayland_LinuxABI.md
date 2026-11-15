@@ -363,8 +363,9 @@ GSList *(*get_formats)(void) = dlsym(h, "gdk_pixbuf_get_formats");
 - カーネル Linux ABI 拡充: [`TODO_Chromium_LinuxABI.md`](TODO_Chromium_LinuxABI.md)
 - vendoring 機構: `Vendor/LinuxRuntime/README.md`, `resolve.sh`, `stage.sh`, `stage-gtkdata.sh`
 - 外来 ABI 既定 envp: `Kernel/Core/process/ProcessManager_Create.c`（POSIX 汎用のみ）＋
-  アプリケーション固有 env: `Userland/API/Source/LinuxEnv.c`
-  （`linux_env_add_*()` グループ、`xsession_run_env()` / `process_spawn_with_env()` で渡す）
+  アプリケーション固有 env: `*/Environment/*.env` のデータファイル（`/etc/ImplusOS/linux-env/`
+  に集約）。`Userland/API/Source/LinuxEnv.c` はその汎用ローダーで、`xsession_run()` /
+  `process_spawn_with_env()` で渡す
 - ランチャ雛形: `Userland/Application/{Doom,Chromium}/Start.c`
 - ネイティブ・コンポジタ（ブリッジ先）: `Userland/Application/com.ImplusOS.windowmanager/`
 - AF_UNIX: `Kernel/IPC/UnixSocket.c`
