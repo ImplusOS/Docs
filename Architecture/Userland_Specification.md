@@ -198,11 +198,11 @@ corner radii and the hover / disabled opacities, and provides
 Theme files hold `accent = #RRGGBB` and `mode = light|dark`; the window
 manager's copy also has a `[Metrics]` section (title bar height, window
 corner radius, shadow spread, taskbar height). The shipped
-`Resource/Themes/Default.theme` is read first and `/var/System/shell.theme`
-(written by `com.ImplusOS.settings`) is applied on top of it -- by the window
-manager and by `theme_load_desktop()` alike. Settings also sends
-`WM_SET_THEME` (`window_set_theme(accent, dark)`), which the shell applies at
-once; applications pick the change up the next time they start.
+`Resource/Themes/Default.theme` is read first and `/var/System/shell.theme`,
+if present, is applied on top of it -- by the window manager and by
+`theme_load_desktop()` alike. `WM_SET_THEME` (`window_set_theme(accent, dark)`)
+changes the theme at runtime; the shell applies it at once and applications
+pick the change up the next time they start.
 
 #### Applications and UI
 
@@ -215,14 +215,6 @@ lists of `{icon, text, subtext}` rows, and a canvas the app paints itself
 (`ui_draw_*()`) for anything the stock widgets do not cover. Callbacks take
 just the widget (`on_action` for click / activate / Enter, `on_change` for
 edits); widget fields are public and set directly.
-
-| Application | What it is |
-|---|---|
-| `com.ImplusOS.editor` | text editor |
-| `com.ImplusOS.filemanager` | file browser |
-| `com.ImplusOS.serialmonitor` | COM1 debug log viewer |
-| `com.ImplusOS.settings` | desktop theme (accent colour + light/dark), CPU/memory/graphics, devices, disks |
-| `com.ImplusOS.taskmanager` | Windows-style task manager: process table (apps / background, heat-shaded CPU / memory / display columns, sort, search, end task, priority), 60 s CPU / per-core / memory / display-transfer graphs, disk capacity, kernel boot-phase timeline, per-process details. Drawn on a UI canvas |
 
 #### Application list (`Linux/WM_DesktopEntry.c`)
 
