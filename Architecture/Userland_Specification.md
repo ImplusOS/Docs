@@ -17,13 +17,10 @@ The init process is the first user-space process loaded by the kernel.
 
 1. Render the boot screen (framebuffer snapshot / gradient fill), load the
    system font, show the localized welcome text and boot count, fade in.
-2. `service_load_all()` — load every service listed in
-   `Userland/Service/services.list` (currently `com.ImplusOS.posix`,
-   `com.ImplusOS.netstack`) via `Userland/Service/service_client.h`.
-3. Spawn `com.ImplusOS.windowmanager` and set its priority; poll
+2. Spawn `com.ImplusOS.windowmanager` and set its priority; poll
    `window_get_wm_pid()` until it registers.
-4. Once the WM is up, spawn `com.ImplusOS.sysnotif` (notification daemon).
-5. Free boot-time buffers and enter the idle loop (`sleep_ms()` forever).
+3. Once the WM is up, spawn `com.ImplusOS.sysnotif` (notification daemon).
+4. Free boot-time buffers and enter the idle loop (`sleep_ms()` forever).
 
 `spawn_with_fallbacks()` tries a list of candidate ELF paths in order, so a
 component can move without breaking init.
@@ -91,12 +88,12 @@ The arm64 variant uses `SVC #0` with the syscall number in register `X8` and
 arguments in `X0`–`X5`. The arch-specific implementation lives in
 `libc/I_libc/src/sys/$(ARCH)/hal_syscall.c`.
 
-## 4. POSIX Compatibility Layer (`Userland/Service/com.ImplusOS.posix/`)
+## 4. POSIX Compatibility Layer (`libc/I_libc/Source/src/posix.c`)
 
-A comprehensive POSIX API mapping layer enabling portable C programs. It is
-built as a **hot-loadable service** (`com.ImplusOS.posix.so`), loaded at init
-from `services.list` and unloadable at runtime via `service_unload()`. See
-`Userland/Service/com.ImplusOS.posix/README_POSIX.md`.
+A POSIX API mapping layer enabling portable C programs, part of libc and
+statically linked into init and every application. Name lookup
+(`getaddrinfo`, `gethostbyname`) is backed by the DNS stub resolver in
+`libc/I_libc/Source/src/resolv.c`.
 
 ### Supported APIs
 
@@ -153,23 +150,16 @@ Userland/Application/
 └── BusyBox/                      BusyBox port (Resource/busybox binary)
 ```
 
-The hot-loadable **services** are a separate tree, `Userland/Service/`
-(`com.ImplusOS.ldso`, `com.ImplusOS.dynmain`, `com.ImplusOS.posix`,
-`com.ImplusOS.netstack`), each with its own `Makefile` including
-`Userland/Service/Common.mk`.
-
 ### Build System
 
 Each application `Makefile` is `include ../../AppCommon.mk`
 (i.e. `Userland/AppCommon.mk`), which provides the common objects (libc,
-`Syscalls.c`, `Userland/API/*` helpers, `Library/` crypto/unicode). Services
-include `Userland/Service/Common.mk`.
+`Syscalls.c`, `Userland/API/*` helpers, `Library/` crypto/unicode).
 
 ### Application ELF Loading
 
-1. App/service ELFs are staged onto the boot filesystem under `/Userland/…`.
-2. Init spawns apps via `process_spawn(path)`; services are brought in by
-   `service_load_all()` (which resolves `/Userland/Service/<name>/<name>.so`).
+1. App ELFs are staged onto the boot filesystem under `/Userland/…`.
+2. Init spawns apps via `process_spawn(path)`.
 3. The kernel loads the ELF and creates a process with a separate address space.
 4. Entry point is `_start()` (not `main()`).
 
@@ -200,9 +190,8 @@ manager's copy also has a `[Metrics]` section (title bar height, window
 corner radius, shadow spread, taskbar height). The shipped
 `Resource/Themes/Default.theme` is read first and `/var/System/shell.theme`,
 if present, is applied on top of it -- by the window manager and by
-`theme_load_desktop()` alike. `WM_SET_THEME` (`window_set_theme(accent, dark)`)
-changes the theme at runtime; the shell applies it at once and applications
-pick the change up the next time they start.
+`theme_load_desktop()` alike. There is no runtime theme switch: the shell
+reads the theme once at startup, and applications when they start.
 
 #### Applications and UI
 
@@ -308,14 +297,12 @@ rather than an X server.
 
 ## 7. Utility Libraries
 
-### DNS Resolver (`Userland/Service/com.ImplusOS.netstack/DNS/DNS.c`)
+### DNS Resolver (`libc/I_libc/Source/src/resolv.c`)
 
-Userland DNS resolver that performs queries over UDP. Built as the hot-loadable
-`com.ImplusOS.netstack` service.
-
-### Dynamic Linker (`com.ImplusOS.ldso` + `com.ImplusOS.dynmain`)
-
-Userland dynamic-linking support for ELF `.so` loading.
+DNS stub resolver behind `getaddrinfo()`/`gethostbyname()`: A queries over UDP
+to the DHCP-leased server (10.0.2.3 when there is none), TCP retry on a
+truncated answer, small per-process TTL cache. Applications use it only
+through `<netdb.h>`.
 
 ### Shared crypto / Unicode (`Library/`)
 

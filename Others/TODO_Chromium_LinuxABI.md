@@ -378,10 +378,9 @@ Chromium を ImplusOS で"実用的に"動かすための現実的な方針:
 | `Kernel/Core/elf/ELF_Loader.c` | linux_abi 判定 + PT_INTERP |
 | `Kernel/Core/vfs/VFS.c` | VFS (procfs/devfs 追加先) |
 | `Kernel/include/kernel/config.h` | リソース上限のコンパイル時定義 |
-| `Userland/Service/com.ImplusOS.posix/src/posix_fdtable.c` | ユーザー側 FD テーブル (1024) |
-| `Userland/Service/com.ImplusOS.posix/src/posix_io.c` | select/poll/fcntl |
+| `libc/I_libc/Source/src/posix.c` | ユーザー側 POSIX 層 (FD テーブル, select/poll/fcntl) |
 | `libc/I_libc/src/posix.c` | POSIX 名ラッパー層 (4275 行) |
-| `Userland/Service/com.ImplusOS.netstack/DNS/DNS.c` | ユーザー側 DNS resolver (UDP/TCP) |
+| `libc/I_libc/Source/src/resolv.c` | ユーザー側 DNS resolver (UDP/TCP, `getaddrinfo` の裏側) |
 | `libc/glibc/` | **glibc submodule**（upstream, pinned `glibc-2.41`） |
 | `libc/build-glibc.sh` | glibc クロスビルド／ステージングスクリプト |
 | `libc/README-glibc.md` | glibc 移植方針・ビルド手順 |

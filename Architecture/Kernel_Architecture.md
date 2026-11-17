@@ -310,7 +310,7 @@ The window manager uses IPC messages for all GUI operations:
 - **ICMP**: Echo request/reply (ping)
 - **DHCP**: Client for dynamic IP configuration, driven centrally from
   `network_stack_on_timer_tick()` (see `Docs/Architecture/Network_Stack.md`)
-- **DNS**: Resolver (userland, `Userland/Service/com.ImplusOS.netstack/DNS/`)
+- **DNS**: Resolver (userland, libc `getaddrinfo` → `libc/I_libc/Source/src/resolv.c`)
 - **TLS**: Record layer + TLS 1.3 key schedule and the underlying crypto
   primitives live in `Library/Crypto/` (shared kernel/userland source)
 

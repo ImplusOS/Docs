@@ -1,20 +1,19 @@
 # Compatibility Layers — ImplusOS
 
 *Last reviewed: 2026-08-29 (post phase P6 of `Docs/Others/TODO_OS_Refactor.md`).
-The userland POSIX layer moved to a hot-loadable service at
-`Userland/Service/com.ImplusOS.posix/`; paths below reflect that.*
+The userland POSIX layer lives in libc, `libc/I_libc/Source/src/posix.c`.*
 
 ## 1. Two different things are both called "compat" in this codebase
 
 It is easy to conflate these — they solve different problems at different
 layers:
 
-| | `Kernel/Compat/` | `Userland/Service/com.ImplusOS.posix/` |
+| | `Kernel/Compat/` | `libc/I_libc/Source/src/posix.c` |
 |---|---|---|
 | **Runs in** | Ring 0 (kernel) | Ring 3 (linked into each process) |
 | **Translates** | A foreign **syscall-number ABI** (which syscall number means what, how arguments are packed) into calls against ImplusOS's real kernel subsystems | ImplusOS's **native syscall API** into POSIX libc entry points (`open`, `read`, `fork`, `socket`, `pthread_*`, ...) |
 | **Chosen by** | `ELF_Loader.c` detecting `EI_OSABI == ELFOSABI_LINUX` in the binary being executed, once, at `exec()` time | Whatever the linked userland binary was compiled against |
-| **Example** | `Kernel/Compat/Linux/Syscall_LinuxCompat.c` — Linux's `SYS_read`/`SYS_openat`/... numbers | `Userland/Service/com.ImplusOS.posix/src/posix_file.c` — `open()` calling `Syscalls_FileOpen()` |
+| **Example** | `Kernel/Compat/Linux/Syscall_LinuxCompat.c` — Linux's `SYS_read`/`SYS_openat`/... numbers | `libc/I_libc/Source/src/posix.c` — `open()` calling `file_open()` |
 
 A Linux-ABI binary running on ImplusOS uses **only** the left column: its own
 libc already speaks raw Linux syscall numbers, so ImplusOS intercepts those
