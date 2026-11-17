@@ -14,8 +14,9 @@
 > - **P8 (CI/CD) は未反映**: `.github/workflows/*` と `.markdownlint.jsonc` は
 >   本ツリーに存在しない。`Kernel/config/arch.mk` の `CI=1`→`-Werror` 昇格
 >   フックのみ実装済み。設計は `Docs/Architecture/CI_CD.md` 参照。
-> - **arm64**: 8章記載の `__trunctfdf2` 未解決リンクエラーは未修正のまま
->   （`make ARCH=arm64 kernel` は現在も失敗する）。
+> - **arm64**: ~~8章記載の `__trunctfdf2` 未解決リンクエラーは未修正のまま~~
+>   **2026-11-17 解消**。`make ARCH=arm64` 全体がビルドでき、QEMU virt（TCG,
+>   4 CPU, GICv2/v3）で LiveCD がデスクトップまで起動する。8.4 節参照。
 > - P7 のドキュメント刷新は 2026-08-29 に再実施
 >   （`README.md` / `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `Docs/Architecture/*`
 >   を現行ソースツリーに合わせて更新）。
@@ -791,6 +792,48 @@ FAT テーブル管理、BPB パース、ディレクトリエントリ操作の
 カーネル内部の抽象化漏れ）。
 
 ---
+
+### 8.4 arm64 起動対応（2026-11-17）
+
+`make ARCH=arm64 image_livecd` → QEMU virt（AAVMF, TCG と HVF, `-smp 4`,
+GICv2/GICv3 とも）でログイン〜ウィンドウマネージャのデスクトップまで起動確認。
+主な修正:
+
+- ビルド: x86 専用インライン asm（`sti; hlt`, `pause`, `%fs:0`）の分岐、
+  `hal_cpu_get_id`/`__clear_cache` の arm64 実装、ユーザーランドに libgcc
+  をリンク（binary128 `long double` の soft-fp、`__trunctfdf2` 問題の解消）、
+  カーネル/ドライバを `-mgeneral-regs-only` に（x86 と同じ理由）。
+- MMU: `init_paging` がファームウェアのページテーブル稼働中に MAIR/TCR を
+  書き換えて即死していたのを、MMU off で一括切替するよう修正。TTBR0 切替時の
+  TLB フラッシュ追加（ASID 未使用のため）。高位 MMIO（PCIe ECAM
+  0x40_1000_0000 等）が `USER_CODE_BASE` 以降と重なり、全プロセスが同じ
+  L2/L3 を共有していた問題を、TTBR1 側エイリアスで返す方式に変更。プロセス破棄
+  時にカーネル共有テーブル/ページまで解放していた問題を修正。デマンドゼロ
+  （`paging_handle_swap_fault`）・`paging_access_is_now_permitted` 実装。
+- 例外: データ/命令アボートを x86 `page_fault_handler` 相当に（デマンド
+  ページング、ユーザー違反はプロセス終了）。未定義命令等はシグナル番号付きで
+  終了。EL0 からの IRQ でのタイマープリエンプション
+  （`process_preempt_from_user_irq_arm64`）。
+- SMP: ACPI MADT GICC の MPIDR と FADT ARM_BOOT_ARCH（HVC/SMC）から PSCI
+  `CPU_ON` で AP 起動、GICv3 再分配器の CPU 毎検出、再スケジュール SGI。
+- その他: PL031 RTC、PSCI `SYSTEM_OFF`/`SYSTEM_RESET`、PCI ECAM は
+  `map_mmio_virt` の戻り値経由。
+
+残課題（x86_64 との差）:
+
+- Linux ABI 互換層・Xorg/Chromium/Wine/BusyBox 等は x86_64 バイナリ前提の
+  ため arm64 では動かない（設計上の差）。
+- COW fork は未実装（eager copy にフォールバック）。フォールト時の SIGSEGV
+  ハンドラ配送は未実装（プロセス終了のみ）。
+- 仮想化（`virtualization_init`）は引き続き非対応スタブ。
+- （解決済み）macOS ホストの HVF: 新しい QEMU は hvf で Apple の in-kernel
+  vGIC（hv_gic）を既定で使い、仮想タイマー割込みが届かず AAVMF 自体が
+  "Start boot option" で止まる。Makefile は Darwin+arm64+hvf で
+  `-machine kernel-irqchip=off` を付ける。また HVF では MMIO を
+  ライトバック付きアドレッシング等（ESR.ISV=0）でアクセスすると QEMU が
+  `Assertion failed: (isv)` で落ちるため、GIC/PL011/PL031/PCI ECAM は
+  `include/interfaces/mmio.h` の asm アクセサ経由にした。他のドライバで
+  同じ abort が出たら同じアクセサに置き換えること。
 
 ## 9. P5: プラットフォーム/ネットワークサブシステムのドライバ化
 
