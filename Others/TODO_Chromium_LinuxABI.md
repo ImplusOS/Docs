@@ -1302,6 +1302,313 @@ X のセットアップ要求が別の接続に届くことになるので、本
 
 ---
 
+## 20. ネットワークが使えない — 原因は 3 つ、どれも TCP/DNS ではなかった (2026-11-21)
+
+**症状**: arm64（トランスレータ経由）では HTTP は通るが HTTPS がすべて失敗する
+（`ERR_CERT_INVALID` / `-202` / `-207`、Google 系の接続は `-107`）。`http://example.com/`
+も HTTPS への自動アップグレードが失敗して `ERR_BLOCKED_BY_CLIENT`。x86_64（macOS の
+TCG）では Chromium がそもそも起動しない（`Failed to open /dev/null` →
+`Cannot communicate with zygote`）。DNS（10.0.2.3）、TCP、330 KB の HTTP 取得はどちらでも正常。
+
+### 20.1 arm64: JIT が論理演算の後のキャリーを捨てていた
+
+`XL_NOJIT=1` と `XL_JIT_DEBUG=f`（毎命令フラグを書き出す）では通るので JIT の遅延フラグ。
+新設の `XL_JIT_FPC=lo-hi`（その範囲で始まるブロックだけ `f`）をゲスト内のスクリプトで
+二分探索し（Chromium 1 回ごとに約 0.9 GB が戻らないため、ホスト側から 1 ブート 4 回まで）、
+`bn_mul_mont_nohw`（BoringSSL）のブロック `0x57bcbd0` に絞った。その関数の機械語を
+そのまま切り出したテストで JIT とインタプリタの結果が 11% の入力で食い違った。
+
+最終減算 `xor %r14,%r14 … sbb (%rcx,%r14,8),%rax` で、`xor` の後の CF は定数 0 なので
+解析（`cf_need(PK_LOGIC)`）は「保持する成分なし」＝ `need == 0` を返す。ところが生成側は
+`need == 0` を「フラグは死んでいる」と読んで保留状態を `PK_NONE` にし、`sbb` は
+メモリに最後に書き出された古いフラグから CF を読んでいた。モンゴメリ乗算の結果が
+ときどき狂い、RSA/ECDSA の署名検証が落ちる。修正は `analyze()` で、生きている
+フラグ生成命令の `need` が空なら `all_need()` にすること。`Tests/x86_diff.c` に
+`t_carry`（STC で古い CF = 1 を残してから論理演算 → ADC/SBB/INC）を追加。修正前の JIT は
+2,106 行食い違い、修正後は 3 エンジンとも Rosetta の参照 159,548 行と一致。
+
+### 20.2 x86_64: 未読み込みのページを指すシステムコール引数が EFAULT
+
+16 MiB 以上の Linux 実行ファイル（Chromium 本体）は x86_64 でデマンドページング
+される（`ELF_Loader.c`）。`process_user_buffer_is_valid()` は Linux プロセスの
+`USER_FOREIGN_BASE..USER_STACK_TOP` で「ページが存在すること」を要求していたので、
+まだ誰も触っていない `.rodata` の文字列を渡す `openat("/dev/null")` が EFAULT になり、
+zygote を起動する子プロセスが `_exit(127)` していた。存在しないページでも FileMap の
+ファイル由来の範囲なら有効とする（コピー時のカーネルモード #PF が
+`filemap_handle_fault()` で読み込む）。
+
+### 20.3 x86_64 (TCG): QEMU の ADX エミュレーション
+
+20.2 の後、HTTPS だけが `ERR_SSL_PROTOCOL_ERROR`。`-cpu Haswell-v4` と `-cpu max,-adx`
+では通り、`-cpu Broadwell-v4`（ADX あり）、`max,-vaes,-vpclmulqdq`、`max,-sha-ni` では
+失敗する。このホストの QEMU 11.1.50 の TCG で BoringSSL の ADCX/ADOX 経路が誤る。
+Makefile の x86_64 向け TCG 既定を `-cpu max,-adx` にした（KVM は対象外）。
+
+### 20.4 確認
+
+- arm64 HVF: ヘッドレスで `https://example.com/`、`https://www.google.com/`、
+  `http://10.0.2.2:8765/`（ホスト）、330 KB の HTTP。GUI のランチャ（uid 1000、
+  サンドボックス有効）で初回起動画面の後に example.com を描画。
+- x86_64 TCG `-cpu max,-adx`: ヘッドレスで `https://example.com/`、
+  `https://www.google.com/`、330 KB の HTTP（ホストへの HTTP と `http://example.com/` は
+  `-cpu max` で確認）。GUI は未確認。
+
+### 20.5 残り
+
+- ヘッドレスの Chromium を終了させても約 0.9 GB の空きメモリが戻らない（kill -9 後も）。
+  8 GiB のゲストで 6〜7 回起動すると枯渇する。
+
+---
+
+## 21. macOS ホストで音が出ない・GPU アクセラレーションが無効 (2026-11-21)
+
+**症状**: macOS（Apple silicon）の `make run_*` で、Chromium の音が出ない。
+chrome://gpu は Software only で、WebGL は使えない。
+
+### 21.1 音: arm64 で HDA ドライバが常に「デバイスなし」を返していた
+
+`HDA_Driver.ELF` の `hda_find()` は `#if !defined(PLATFORM_X86_64) return false;`
+で始まっていた（ディレクトリ再編の時点からそうなっており、移植されていなかった）。
+arm64 では音声デバイスが一つも無いので、`alsa_pcm_open()` は `E_NODEV` を返す。
+Chromium は無音のフェイク出力に切り替わる。
+VirtIO-Sound は `stream_*` インタフェースを持たないので、そもそも `/dev/snd` の
+バックエンドになれない（`audio_manager_stream_ok()` が偽）。AC97 はポート I/O なので
+x86_64 専用のまま。
+
+**修正**（`Kernel/Source/Drivers/Audio/HDA/HDA.c`）: アーキテクチャ判定を外した。
+レジスタアクセスはすべて `interfaces/mmio.h`（単一の LDR/STR）経由にした。
+HVF では、ライトバック形式やペア形式の MMIO アクセスを QEMU が再実行できず
+abort する（`mmio.h` の説明参照）。
+BAR0 は AAVMF が割り当て、`map_mmio_range()` で写す（VirtIO ドライバと同じ経路）。
+DMA リング・LPIB ポーリング・コーデック設定は x86_64 と共通。
+
+**ホスト側**（`Makefile`、Darwin のみ）: 音声バックエンドを
+`-audiodev coreaudio,id=snd0` と明示し、コーデックを `hda-output` にした。
+既定の `hda-duplex` は入力ピンを持つが、QEMU の Core Audio は出力専用である。
+そのため起動時に `audio: Can not open 'adc' (no host audio driver)` と出て、
+音声が壊れているように見えていた（実際には出力は Core Audio に出ている）。
+
+**確認**（QEMU の `-audiodev wav` で録音し、10 ms 窓の RMS と FFT で解析）:
+
+| 構成 | ネイティブ ALSA テスト（1 kHz 矩形波 2 秒、生 ioctl） | Chromium（WebAudio 440 Hz、GUI、自動再生） |
+|---|---|---|
+| arm64 HVF `-smp 4` | 96000 フレーム、途切れなし、drain 正常 | 鳴る。約 190 秒中、途切れは起動直後の 1 回（160 ms）だけ |
+| x86_64 TCG `-smp 4` | 96000 フレーム、途切れなし、drain 正常 | 鳴るが、Chromium の負荷で途切れが多い（TCG の速度の限界） |
+
+**ついでに直したもの**（`Kernel/Source/Core/sound/ALSA.c`、両アーキ共通）:
+ブロッキングの `DRAIN` は、最初の呼び出しで `DRAINING` にして `ALSA_WOULD_BLOCK`
+を返し、Linux 層が少し待ってから再実行する。その間にタイマ tick のポンプが
+最後の周期を出し切って `SETUP` に進めると、再実行は「`SETUP` での DRAIN」と
+みなされて `EBADFD` を返していた。結果として `snd_pcm_drain()` がタイミング次第で
+失敗していた（arm64 で再現。x86_64 では同じテストが通った）。
+待ち中であることを `drain_wait` に記録し、再実行で `SETUP` を見たら 0 を返す
+（Linux でも、排出の完了や DROP で待ちが終われば 0）。修正後は arm64 で 3 回連続
+`drain=0`。
+
+### 21.2 GPU: ホストの QEMU に virgl が無い（ゲスト側の不具合ではない）
+
+GPU 機能は、カーネルが `SYSTEM_GRAPHICS_ACCEL_3D` を報告したときだけ有効になる
+（§13.2）。これは virtio-gpu が `VIRTIO_GPU_F_VIRGL` を出したとき、つまり
+ホストが `virtio-gpu-gl-pci` を提供したときに限られる。
+Homebrew の QEMU（このホストでは HEAD-efa3b9d）は virglrenderer も OpenGL も
+リンクしていない。`-device help` に `virtio-gpu-gl-pci` が無く、
+`-display cocoa` にも `gl=` が無い。
+このため macOS では次のようになる。
+
+- arm64 は 2D の `virtio-gpu-pci`、x86_64 は標準 VGA で動く。
+- カーネルは 3D なしを報告し、ランチャは `--ignore-gpu-blocklist` を付けない。
+- Chromium はソフトウェア合成になる。
+- Chromium 160 は SwiftShader への自動フォールバックを廃止しているので、
+  `WebGL: unavailable` になる（GUI のテストページで確認）。
+
+ホスト GPU を使うには、virgl 対応の QEMU が必要である。候補は二つある。
+
+- UTM：virglrenderer と ANGLE（Metal）を同梱している。
+- QEMU を `--enable-virglrenderer --enable-opengl` で作り直し、GL 対応の
+  表示（SDL など）と組み合わせる。
+
+ゲスト側の arm64 virgl 経路（DRM_Kms/VirtIO の 3D、トランスレータ上の
+x86_64 Mesa）は未検証。
+
+### 21.3 残り
+
+- 音声デバイスの選択は `priority` だけで決まる（VirtIO-Sound 10 < HDA 20）。
+  `-device virtio-sound-pci` を足すとそちらが選ばれる。
+  ストリーム非対応なので `/dev/snd` は `ENODEV` になる。
+- x86_64 TCG での途切れは未調査（CPU 不足と見ている。KVM では §13.3 のとおり）。
+
+---
+
+## 22. UTM（vmnet「共有」）で ERR_NAME_NOT_RESOLVED — DHCP がパラメータを要求していなかった (2026-11-22)
+
+**症状**: UTM（arm64、`-netdev vmnet-shared`）で、Chromium のすべてのページが
+`ERR_NAME_NOT_RESOLVED` になる。QEMU の user-net（SLIRP）では問題ない。
+
+**原因**: vmnet の DHCP サーバは macOS の bootpd である。bootpd が OFFER/ACK に
+サブネットマスク・ルータ・DNS を入れるのは、クライアントがオプション 55
+（パラメータ要求リスト）で求めたときだけである（`apple-oss-distributions/bootp`
+の `dhcpd.c` の `dhcp_request()`。オプション 55 が無ければ `add_subnet_options()`
+を呼ばない）。
+ImplusOS の DISCOVER/REQUEST はオプション 55 を持っていなかったので、
+リースはアドレスだけになっていた。その結果、次のように名前解決が失敗していた。
+
+1. マスク 0.0.0.0、ルータなし、DNS なしで `ipv4_set_address()` される。
+2. `/etc/resolv.conf` は SLIRP 用の 10.0.2.3 にフォールバックする。
+3. ゲストは 192.168.64.x から 10.0.2.3 を ARP で探し続ける。
+4. すべての名前解決が失敗する。
+
+SLIRP や一般的なルータは、要求されなくてもこれらを送るので気づかなかった。
+
+ほかにも、DHCP クライアントには次の問題があった（`Network/dhcp/DHCP.c`）。
+
+- 送信元 IP が静的なフォールバックの 10.0.2.15 になっていた。
+  RFC 2131 §4.1 では、リース前は 0.0.0.0 でなければならない。
+- メッセージが 244/256 バイトで、BOOTP の最小長 300 バイト（RFC 1542 §2.1）に
+  満たなかった。
+- OFFER を受けた時点で `g_dhcp_assigned_ip` を立てていた。そのため
+  `network_stack_on_timer_tick()` の再試行（取得済みアドレスが 0 の間だけ）が
+  止まり、ACK が来なくても、NAK が来ても二度と DISCOVER しなかった。
+
+**修正**:
+
+- `Network/dhcp/DHCP.c`
+  - DISCOVER/REQUEST にオプション 55（1, 3, 6, 15, 28）を付ける。
+  - メッセージを 300 バイトまで詰め、送信元は 0.0.0.0 にする。
+  - 取得済みアドレスは ACK で初めて立てる。OFFER のアドレスは別の変数に持つ。
+    NAK を受けたら最初からやり直す。
+  - ACK にマスクが無ければクラスのマスクを使う。DNS が無ければルータを DNS とみなす。
+  - リースをシリアルに `[DHCP] lease A mask M gw G dns D server S` と出す。
+- `Network/ipv4.c`、`Network/udp/UDP.c`: 送信元を指定できる
+  `ipv4_send_from()` / `udp_send_from()` を追加した。任意の送信元が使えるのは
+  宛先が 255.255.255.255 のときだけ。
+
+**確認**: vmnet はホストの root 権限か entitlement が無いと使えない。そこで
+`-netdev dgram` の先に、bootpd と同じ規則で答える偽のネットワークを置いた。
+これは Python のスクリプトで、ARP・DHCP・DNS（任意の名前に A を返す）・
+TCP（RST を返す）を扱う。
+
+| | 修正前（同じ偽ネットワーク） | 修正後 |
+|---|---|---|
+| DISCOVER | 244 バイト、送信元 10.0.2.15、オプション 55 なし | 300 バイト、送信元 0.0.0.0、オプション 55 は [1, 3, 6, 15, 28] |
+| ACK | マスク・ルータ・DNS なし | すべてあり |
+| その後 | `ARP who-has 10.0.2.3` が応答なしのまま | `nameserver 192.168.64.1`、Chromium が example.com を名前解決して TCP 接続 |
+
+- SLIRP（arm64 HVF）: 修正後もリースは 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3 で、
+  ヘッドレス Chromium は本物の `http://example.com/` を取得できた。
+- x86_64 TCG（SLIRP）: リース取得を確認した。
+- 実際の UTM（vmnet）では未確認。
+
+### 22.1 残り
+
+- リースを更新しない（RENEW/REBIND なし）。vmnet のリースは 3600 秒。
+- `/etc/hosts` の `implusos` は静的な `OS_CONFIG_NET_IPV4_ADDR` のまま。
+
+---
+
+## 23. UTM で ERR_FAILED — TCP が相手の MSS を無視していた／GPU は ES 3.0 に届かない (2026-11-22)
+
+**症状**: §22 の修正後、UTM（arm64、vmnet 共有）で名前解決は通るようになった。
+しかし HTTPS のページが `ERR_FAILED` になる。ネットワークサービスのログは次のとおり。
+
+```
+WARNING:net/base/net_errors_posix.cc:127] Unknown error Input/output error (5) mapped to net::ERR_FAILED
+ERROR:net/socket/ssl_client_socket_impl.cc:946] handshake failed; returned -1, SSL error code 1, net_error -2
+```
+
+平文の小さな HTTP は通る。QEMU の SLIRP では起きない。
+
+### 23.1 原因
+
+TCP に一時的な計装を入れ、UTM 上で取ったログで次のことが分かった。
+
+- サーバの SYN-ACK が告げる MSS は 1412 / 1400 だった。上流の MTU が 1500 より
+  小さく、ルータが MSS を絞っている。
+- `Network/tcp/TCP.c` は MSS オプションをまったく扱っていなかった。自分の SYN で
+  MSS を告げず、相手の MSS も読まずに、常に最大 1460 バイトで送っていた。
+- TLS の ClientHello（ポスト量子鍵共有つきで約 1.9 KB）の最初の 1460 バイトの
+  セグメントは経路で捨てられる。再送も同じ大きさなので通らない。
+- 5 回の再送で接続を捨て（`retx limit`）、以後の `recv` は -1 を返す。
+  ソケット層はこれを一律に `EIO` にしていた。Chromium は未知の errno を
+  `ERR_FAILED` にする。
+- SLIRP ではホストのソケットが分割し直すので見えなかった。
+
+あわせて、次の 2 点も直した。
+
+- 死んだ接続の理由（RST・再送の打ち切り）が `EIO` に潰れていた。
+- Linux 層の `getsockopt(SO_ERROR)` が常に 0 を返していた。カーネル側にある
+  ETIMEDOUT の判定に届いていなかった。そのため、非ブロッキング connect が
+  失敗しても成功に見え、その後の読み書きが EIO になった。
+
+### 23.2 修正
+
+- `Network/tcp/TCP.c`、`TCP.h`
+  - SYN / SYN-ACK に MSS 1460 を付ける。
+  - 相手の SYN の MSS を `snd_mss` に保持し（無ければ RFC 879 の 536）、送信と
+    再送のセグメント長の上限にする。
+  - 接続が死んだ理由を `error` に記録する。SYN_SENT 中の RST は ECONNREFUSED、
+    それ以外の RST は ECONNRESET、再送の打ち切りは ETIMEDOUT。
+    `tcp_connection_error()` で読める。
+  - 死んだ接続の poll に POLLERR を立てる。
+- `Core/syscall/Syscall_Socket.c`
+  - `recv` / `send` の失敗を、記録した理由（負の errno）として返す。
+  - ハンドシェイク中なら EAGAIN を返す。
+  - `SO_ERROR` も記録した理由を返す。
+- `Compat/Linux/Syscall_LinuxCompat.c`: inet ソケットの `SO_ERROR` をカーネルの値で返す。
+
+**確認**:
+
+- UTM 実機（HVF、vmnet 共有）: ヘッドレス Chromium で `https://example.com/`、
+  `https://www.google.com/`、`https://www.wikipedia.org/` を取得できた。
+  GUI のランチャ（`https://example.com/`）でもハンドシェイクの失敗は 0 件。
+- SLIRP（arm64 HVF）: 同じ 3 件と `http://neverssl.com/` で回帰なし。
+
+検証方法: UTM の AppleScript で別の VM（`ImplusOS-Diag`、シリアルは PTY）を作り、
+`utmctl start --hide` で起動し、PTY を `cat` で読んだ。UTM の PTY は 30 KB 前後で
+出力が止まることがあるので、結果はゲスト内のファイルに落とし、必要な行だけを出す。
+
+### 23.3 GPU: UTM の virgl では Chromium の GPU プロセスが ES 3.0 を得られない
+
+UTM（virtio-gpu-gl-pci、virglrenderer + ANGLE）では、ランチャが
+`--ignore-gpu-blocklist` を付ける。それでも GPU プロセスは
+`GLES3 is unsupported and ES version fallback is disabled` で終了し、
+Chromium はソフトウェア合成になる（WebGL も使えない）。ゲストで調べた内容は次のとおり。
+
+- ゲストの Mesa（virgl）が出せるのはデスクトップ GL 2.1（GLSL 1.20）と ES 3.0 まで。
+  ホストの GLSL レベルは 130（OpenGL ES ホスト）。
+  Xorg の glamor は GL 2.1 で足りるので動く。
+- `MESA_GL_VERSION_OVERRIDE=4.1` で GL 4.1 core のコンテキストは作れるようになった。
+  それでも `GL_MAX_SAMPLES` が 1 で、ANGLE は ES 2.0 までしか出さない
+  （ES 3.0 は 4 以上が必須）。Chromium は ES 3.0 を必須にしている。
+  ES 2 に戻すスイッチは無い。
+- 1 の原因は、ホストがマルチサンプルテクスチャを持たないこと。capset の
+  `max_samples` は 4 だが、`bset.texture_multisample` が 0 で、
+  `supported_multisample_formats` も空。
+  capset のビットを立てても、フォーマット表まで偽らないと Mesa は MSAA を出さない。
+  さらに偽れば、ホストが作れない MSAA リソースを要求することになる。
+- UTM のレンダラを ANGLE の Metal バックエンド（`QEMURendererBackend=2`）に
+  しても同じだった（GLSL 130、texture_multisample なし）。
+
+ゲスト側では解決できない。ホストの virglrenderer がマルチサンプルテクスチャを
+提供する必要がある（GLES 3.1 以上のホスト、またはデスクトップ GL のホスト）。
+実験用のコード（GL を上書きする環境、capset の書き換え）は入れていない。
+
+### 23.4 残り
+
+- PMTUD は無い（ICMP の Fragmentation Needed を無視する）。ルータが MSS を
+  絞らない経路で MTU が小さいと、同じ症状が出る。UTM の実測では
+  ICMP は届かず、MSS は絞られていた。
+- RST のシーケンス番号を検証していない（RFC 5961）。
+- ヘッドレスの `--dump-dom` で HTTP 専用サイトを開くと、HTTPS への自動
+  アップグレードが失敗したところで `ERR_BLOCKED_BY_CLIENT` として終わる
+  （`--disable-features=HttpsUpgrades` なら読める）。Chromium 側の挙動で、
+  GUI では HTTP に戻って表示される想定。
+- GPU プロセスが終了するときに、トランスレータの内部で書き込み違反
+  （`[EXC] ... PerfettoTrace` / `ThreadPoolServi`、ページ末尾を越える書き込み）が
+  起き、`exit_code=11` になる。初期化に失敗した後の終了処理なので、表示には
+  影響しない。未調査。
+
+---
+
 ## 10. 残課題 — SMP でのメモリ破壊（2026-09-06 時点の唯一のブロッカー）
 
 `-smp 1` では headless Chromium が長時間安定して動くのに、`-smp 2` 以上では

@@ -409,7 +409,9 @@ Drivers support runtime unload/reload:
 - **Timer**: ARM Generic Timer (`Kernel/Arch/arm64/timer/GenericTimer.c`)
 - **UART**: PL011 serial driver (`Kernel/Arch/arm64/hal/uart_hal.c`)
 - **Block**: AHCI/NVMe/VirtIO-Block storage drivers (shared with x86_64)
-- **Audio**: AC97/HDA/VirtIO-Sound drivers (shared with x86_64)
+- **Audio**: HDA and VirtIO-Sound drivers (shared with x86_64); AC97 is
+  x86_64 only (port I/O). HDA is the one that backs `/dev/snd` (ALSA):
+  it is the only driver with the `stream_*` interface `Core/sound/ALSA.c` uses
 
 ### 10.3 Interrupts
 
