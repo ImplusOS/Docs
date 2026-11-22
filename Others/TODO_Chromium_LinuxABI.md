@@ -1430,6 +1430,10 @@ Homebrew の QEMU（このホストでは HEAD-efa3b9d）は virglrenderer も O
 ゲスト側の arm64 virgl 経路（DRM_Kms/VirtIO の 3D、トランスレータ上の
 x86_64 Mesa）は未検証。
 
+> **追記 (2026-11-22)**: Homebrew の `milesbuckton/qemu-virgl` が後者に当たる
+> （Makefile は、入っていれば arm64 の `run_*` で自動的に使う）。ホストの GL は UTM と同じ
+> ANGLE の ES 3.0 なので、Chromium は §23.3 と同じ理由でソフトウェア描画になる（§25）。
+
 ### 21.3 残り
 
 - 音声デバイスの選択は `priority` だけで決まる（VirtIO-Sound 10 < HDA 20）。
@@ -1592,6 +1596,9 @@ Chromium はソフトウェア合成になる（WebGL も使えない）。ゲ�
 提供する必要がある（GLES 3.1 以上のホスト、またはデスクトップ GL のホスト）。
 実験用のコード（GL を上書きする環境、capset の書き換え）は入れていない。
 
+> **追記 (2026-11-22, §25)**: 形式表（深度・ステンシル形式を含む）まで偽れば ES 3.0 に
+> 届くことは確認した。ただしホスト依存の回避なので取り下げた（§25）。
+
 ### 23.4 残り
 
 - PMTUD は無い（ICMP の Fragmentation Needed を無視する）。ルータが MSS を
@@ -1606,6 +1613,184 @@ Chromium はソフトウェア合成になる（WebGL も使えない）。ゲ�
   （`[EXC] ... PerfettoTrace` / `ThreadPoolServi`、ページ末尾を越える書き込み）が
   起き、`exit_code=11` になる。初期化に失敗した後の終了処理なので、表示には
   影響しない。未調査。
+
+---
+
+## 24. Discord で ERR_SSL_PROTOCOL_ERROR が大量に出る — recv(MSG_PEEK) が普通の recv だった (2026-11-22)
+
+**症状**（UTM arm64、§23 の修正後）:
+
+- Discord のログイン画面で `ERR_SSL_PROTOCOL_ERROR` が大量に出る。
+- example.com で、HTTPS-First の「安全な接続をサポートしていません」が出ることがある。
+- X ではログインの時点で一時的な制限がかかる。
+
+### 24.1 原因
+
+Chromium は「この接続はまだ生きているか」を `recv(fd, &c, 1, MSG_PEEK)` で
+確かめる（`SocketPosix::IsConnected()` / `IsConnectedAndIdle()`）。呼ぶのは、
+プールや preconnect のソケットを渡す前と、生きている HTTP/2 セッションで
+新しいストリームを開く前である。
+
+Linux 層の `recvfrom` / `recvmsg` は flags を捨てていた（`(void)flags`）。
+そのため確認のたびに TCP の受信バッファから 1 バイトが本当に消えていた。
+TLS ではそのバイトを含むレコードが復号できず（`bad_record_mac`）、セッションに
+載っていたリクエストがすべて `ERR_SSL_PROTOCOL_ERROR` で失敗する。
+
+- Discord は数百本のストリームを一度に開く。読み込みループが読み込みの合間に
+  いるあいだに確認が走ると、セッションごと失敗する。
+- example.com は、HTTPS の読み込みが失敗したので HTTPS-First の警告になった。
+- X は、ログインの API 呼び出しが同じように失敗する。そのため一時的な制限に
+  なったと見ている。ただしログインしての確認はしていない（24.4）。
+
+修正前のネットログ（SLIRP、ヘッドレスで `https://discord.com/login`）では、
+次の順に起きていた。
+
+1. 生きている HTTP/2 セッション上で、約 250 本のリクエストを一度に送る。
+2. その直後の 17408 バイトの読み込みで、クライアントが `SSL_ALERT_SENT 02 14`
+   （fatal / bad_record_mac）を送る。
+3. 685 件のリクエストが `ERR_SSL_PROTOCOL_ERROR` で終わる。
+
+ゲスト内の試験（`xlnet peek`、24.3）で確かめた修正前の動作:
+
+- 1 バイトの PEEK を 2 回すると、`'0'` と `'1'` が返る。PEEK のたびに消費されていた。
+- 続く read は 100 バイトのうち 98 バイトしか返さない。
+
+### 24.2 修正
+
+- `Network/tcp/TCP.c`、`Core/syscall/Syscall_Socket.c`、`Compat/Linux/Syscall_LinuxCompat.c`
+  - `tcp_peek()` を追加し、`syscall_socket_recvfrom_flags()` 経由で
+    `recvfrom` / `recvmsg` の `MSG_PEEK` を通す。UDP も `udp_user_recv_ex()` で同様。
+
+同じ経路を調べていて見つかった次の不具合も直した。
+
+- **送信バッファが満杯のとき、`send()` が 0 を返していた。** Chromium の
+  `SocketBIOAdapter` はこれを「0 バイト書けた」と読み、EPOLLOUT を待たずに
+  ループしていた。`EAGAIN` を返すようにした。ブロッキングソケットは
+  `linux_unix_block_retry()` で待って再実行する。
+- **送信に失敗したデータが再送バッファに二重に入っていた。** `tcp_send()` は、
+  送る前にデータを再送バッファへ積んでいた。ARP 未解決や NIC のリングが満杯で
+  送信に失敗すると、`snd_nxt` は進まないのにデータは残る。呼び出し側が同じ
+  データを送り直すと、もう一度積まれる。以後の再送は、新しいシーケンス番号の
+  位置に古いバイトを載せて送る。送れたチャンクだけを積むようにした。
+- **ARP の解決を、割り込み禁止のまま待っていた。** `arp_resolve()` は TCP の
+  ロックを持ったまま呼ばれることがある。そこで NIC をポーリングすると、受信した
+  セグメントが `tcp_on_ipv4()` に入り、同じ CPU が持っているロックを待ち続ける。
+  `sti; hlt` を通ってタイマ割り込みから TCP タイマに入っても同じことが起きる。
+  - 割り込み禁止で呼ばれたときは、要求を送るだけで待たないようにした。
+    パケットは捨て、TCP の再送に任せる。
+  - TTL を過ぎたエントリは消さずに使い続け、1 秒ごとに問い合わせ直す。
+    60 秒たっても返事が無ければ消す。
+- **再送**
+  - 重複 ACK を 3 つ受けたら、すぐ再送する（高速再送）。
+  - 再送の後に部分 ACK を受けたら、次のセグメントをすぐ再送する。
+    以前は 1 セグメントごとに 1 秒の再送タイマを待っていた。
+  - `CLOSE_WAIT` / `FIN_WAIT_1` / `LAST_ACK` / `CLOSING` でも、データを
+    FIN より先に再送する。以前は ESTABLISHED のデータしか再送せず、
+    FIN だけを順序外で送り続けていた。
+  - 再送タイマを指数バックオフ（1, 2, 4, 8, 16 秒）にした。固定 1 秒で 5 回
+    だったので、経路が 5 秒止まるだけで接続が切れていた。
+- **受信**
+  - すでに受け取ったバイトと重なる再送セグメントは、新しい部分だけを取る。
+  - RST を受けた後も、受信済みのデータは読める（Linux と同じ）。
+  - `TIME_WAIT` などで相手の FIN を受けた後は、EOF（0）を返す。
+- **接続スロット**
+  - ソケットを閉じた後に `FIN_WAIT_2` のまま止まった接続は、60 秒で解放する。
+  - `shutdown(SHUT_WR)` は、ソケットが持つ接続の参照を落としていた。接続が終わると
+    スロットが再利用され、二つのソケットが一本のストリームを共有した。
+    `tcp_shutdown_write()` を分けた。
+
+### 24.3 確認
+
+ゲスト内の試験プログラム（`xlnet`、x86_64 の静的バイナリ）とホストの Python
+サーバを使った（SLIRP）。
+
+| 試験 | 修正前 (arm64 HVF) | 修正後 (arm64 HVF) | 修正後 (x86_64 TCG) |
+|---|---|---|---|
+| `MSG_PEEK`（recvfrom / recvmsg） | 1 バイト / 10 バイト消費 | 消費なし | 消費なし |
+| 送信バッファ満杯の `send()` | 0 を 127〜129 回 | `EAGAIN` | `EAGAIN` |
+| 6 本並列で 24 MiB 受信、パターン照合 | 一致 | 一致 | 一致（4 本） |
+| 遅い読み込み＋受信中の送信 | 一致 | 一致 | 一致 |
+| 読み込みのたびに PEEK を挟む | 全接続で破損 | 一致 | 一致 |
+| Chromium: `https://discord.com/login` | `ERR_SSL_PROTOCOL_ERROR` 685 件 | 0 件（2 回） | — |
+| Chromium: x.com ログイン画面、example.com | — | ネットワークエラーなし | example.com 表示 |
+| Chromium: preconnect したソケットの再利用（自前の HTTP/1.1 TLS サーバと実サイト 3 件） | 完了せず | 4 件とも成功 | — |
+
+### 24.4 未確認
+
+- X の一時的な制限: ログインはしていない。修正後、ログイン画面の読み込みで
+  ネットワークエラーは出ていない。X 側のボット判定など、ほかの理由で制限が
+  かかる可能性は残る。
+- GUI でアドレスバーに入力したときの動作（UTM 実機）は確かめていない。
+  ヘッドレスでは `https://example.com/` を表示できた。
+
+### 24.5 残り
+
+- QUIC がまったく使えない。`recvmmsg()` が AF_INET で `EOPNOTSUPP` を返す
+  （`linux_recvmmsg()` は AF_UNIX のみ）。Chromium は `ERR_NOT_IMPLEMENTED` で
+  QUIC を諦め、TCP にフォールバックする。表示には出ない。
+- Linux プログラムに返す IPv4 アドレスのバイト順が逆。`getsockname` /
+  `getpeername` / `recvfrom` / `recvmsg` が対象（ネットログでは
+  `local_address: 15.2.0.10`）。カーネル内部はホスト順で持ち、返すときに
+  戻していない。Chromium の接続は自分で記録した相手アドレスを使うので
+  影響しない。返信元を照合する resolver（glibc など）には影響しうる。
+- TCP は相手の受信ウィンドウ（`snd_wnd`）を守らない。順序外のセグメントは保持しない。
+  SACK とウィンドウスケールも無い。
+- ブロッキングの TCP `recv` は、受信バッファが空のとき 0 を返す（以前から）。
+
+---
+
+## 25. ES 3.0 の virgl ホスト（qemu-virgl / UTM）で分かったこと — ゲスト側の回避は取り下げ (2026-11-22)
+
+macOS の virgl 対応 QEMU（Homebrew の `milesbuckton/qemu-virgl`、QEMU 11.1.91 + virglrenderer +
+ANGLE）でも、Chromium は §23.3 と同じく `GLES3 is unsupported` でソフトウェア描画になる。
+ホストの GL は UTM と同じで、ANGLE の GL バックエンド（下は Apple の GL 4.1）である。
+原因はホストの virglrenderer にある。ゲスト側で回避して WebGL 2 と文字表示まで動かしたが、
+ホストの性質に応じて動作を変える変更なので、すべて取り下げた（コードは入っていない）。
+
+### 25.1 ホスト側の問題 1: マルチサンプルテクスチャが無い → ANGLE が ES 2.0 止まり
+
+- ホストで作れる ANGLE のコンテキストは ES 3.0 まで（3.1 / 3.2 は失敗）。GL_MAX_SAMPLES は 4。
+  マルチサンプルの*テクスチャ*は `GL_ANGLE_texture_multisample` 経由でのみ使え、
+  ホスト上の確認では `glTexStorage2DMultisampleANGLE` は 4 サンプルまで成功した。
+- virglrenderer は `texture_multisample` を GL 3.2 / ES 3.1 / `GL_ARB_texture_multisample` でしか
+  判定しない（`FEAT(texture_multisample, 32, 31, ...)`）。このため capset の bit 14 は 0、
+  `supported_multisample_formats` も空になり、ゲストの Mesa は GL_MAX_SAMPLES 1 になる。
+- ANGLE（Chromium 160 に静的リンク）は、ES 3.0 必須のレンダバッファ形式（深度・ステンシルを含み、
+  整数形式は除く）がすべて 4 サンプルに届かないと ES 2.0 に制限する
+  （`renderergl_utils.cpp` の `GenerateTextureFormatCaps`）。
+- ES ホストではゲストのデスクトップ GL が 2.1 止まり（glsl_level 130）。このため ANGLE の
+  既定の GL バックエンドではなく、`--use-angle=gles` が要る。
+- 試した回避: capset に MSAA と形式表を書き、マルチサンプルのリソースを 1 サンプルで作る。
+  深度形式は `v1.depthstencil` ではなく `v1.sampler` にしか無い（virglrenderer は前者を埋めない）。
+  これで ES 3.0 に届き、WebGL 2 は `ANGLE (Mesa, virgl (ANGLE (Apple Apple M3 ...)), OpenGL ES 3.0)`、
+  54 fps で描画した。
+
+### 25.2 ホスト側の問題 2: 整数の頂点属性が壊れる → GPU で描く文字が消える
+
+- 25.1 の回避の後、文字だけが消えた（ページ、タブ名、アドレスバー、Canvas の `fillText`）。
+  切り分けでは、R8 / ALPHA / LUMINANCE テクスチャ、部分アップロード、PBO はすべて正常だった。
+  一方、`in uvec2` + `vertexAttribIPointer(UNSIGNED_SHORT)` は (200,50) が (255,255) になった。
+  Skia は GPU で文字を描くとき、アトラス座標を `ushort2` の整数属性で渡す。
+- 原因: `vrend_renderer.c` は、どの頂点要素が整数かを記録する `UPDATE_INT_SIGN_MASK` を、
+  `vrend_bind_vertex_elements_state` の `has_feature(feat_gles31_vertex_attrib_binding)` の中でしか呼ばない。
+  そのため GL 4.3 / ES 3.1 未満のホストでは、シェーダは入力を float で宣言し、
+  旧経路は `glVertexAttribIPointer` で結び付ける。型が一致しないので値が壊れる。上流の main も同じ。
+- 試した回避: このホストでは `--disable-gpu-rasterization --disable-accelerated-2d-canvas`
+  を付ける（ラスタライズは CPU、合成と WebGL は GPU）。これで文字は描かれた。
+- ホスト側の修正案: `UPDATE_INT_SIGN_MASK` を `vrend_create_vertex_elements_state` に移す（約 10 行）。
+  未検証。
+
+### 25.3 ホスト側で直すべきこと
+
+1. virglrenderer: ES 3.0 ホストで `GL_ANGLE_texture_multisample` を使って `texture_multisample`
+   を出す（またはマルチサンプルをレンダバッファで持つ）。
+2. virglrenderer: 整数頂点属性のマスクを、頂点属性バインディングの有無に関係なく記録する（25.2）。
+
+この 2 つが直れば、ゲスト側は `--use-angle=gles`（ES ホストでデスクトップ GL が 2.1 止まりのため）
+だけで Chromium がホスト GPU を使えるはずである。
+
+メモ: この QEMU では `-display egl-headless` は起動直後に SEGV し、`-display none` は
+virgl を拒否するので、検証は `cocoa,gl=es` のウィンドウで行った。
 
 ---
 

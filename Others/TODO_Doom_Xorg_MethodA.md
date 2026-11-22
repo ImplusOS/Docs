@@ -1967,3 +1967,71 @@ chrome spawn より前にある)。
   プロセス回収の取りこぼしが疑われる。
 - クラッシュハンドラ内で `movaps %xmm0,-0x30(%rbp)` が #GP =
   **ユーザスタックが 16 バイト境界に載っていない**。M24 の SSE 問題と同系統。
+
+---
+
+## M28. virgl の ES ホスト（macOS の qemu-virgl / UTM）で Doom が白いまま (2026-11-22)
+
+**症状**: arm64 の `make run_uefi_cdrom`（macOS では `milesbuckton/qemu-virgl` があれば
+`QEMU_GPU=virgl` が既定）で Doom を起動すると、"DOOM" ウィンドウは出るが白一色のまま進まない。
+同じイメージを `virtio-gpu-pci`（3D なし）で起動すると正常に描画される。
+
+**ログ**（Doom の stderr。シリアルに出る）:
+
+```
+context: 0x44fe1f2540
+make current
+Error while compiling vertex shader:
+0:1(10): error: GLSL 3.30 is not supported. Supported versions are: 1.10, 1.20, 1.00 ES, and 3.00 ES
+Error while compiling fragment shader:
+0:1(10): error: GLSL 3.30 is not supported. ...
+error: linking with uncompiled/unspecialized shader
+```
+
+一時的な計測（XSession がウィンドウのバッキングストアを数える）では、白画面の間は
+全ピクセルが `0xFFFFFF` だった（`white=9143 black=0 other=0`）。Doom 本体は動き続けており
+（デモ再生・`Reading screen...` が出る）、描画だけが 1 枚も出ていない。
+
+### 真因
+
+- Doom は従来の `glXCreateContext()` でコンテキストを作る。これは**互換プロファイル**で、
+  その上で `#version 330` のシェーダをコンパイルする。
+- 3D レンダノードがあると `x11-client.env` は Mesa の選択に口を出さないので、Doom は
+  `virtio_gpu_dri.so`（virgl）を使う。
+- ホストが OpenGL ES（ANGLE ES 3.0）のとき、ゲスト Mesa の virgl が出せるデスクトップ GL は
+  2.1 / GLSL 1.20 まで（TODO_Chromium_LinuxABI.md §23.3 / §25 と同じ制限。glsl_level 130）。
+- そのため**シェーダが 1 本もコンパイルできず**、Doom は描画しないまま `glXSwapBuffers` を続ける。
+  ウィンドウはサーバが塗った白のまま変わらない。
+
+### 対処
+
+ホストの能力で分岐させるのではなく、**Doom は 3D レンダノードの有無に関係なく常に llvmpipe** にした。
+Doom は CPU でゲームを描き、GL では 320x200 のパレット変換を 1 回するだけなので、GPU に載せる意味がない。
+llvmpipe はどのマシンでも 3.3 の互換プロファイルを出せる。
+
+| ファイル | 変更 |
+|---|---|
+| `Userland/API/Environment/gl-software.env` | 新規。`x11-client.env` の `[if !accel3d]` ブロック（`LIBGL_ALWAYS_SOFTWARE=1` / `GALLIUM_DRIVER=llvmpipe` / `MESA_LOADER_DRIVER_OVERRIDE=kms_swrast` / `LP_NUM_THREADS=1`）をそのまま移した |
+| `Userland/API/Environment/x11-client.env` | `[if !accel3d]` の中身を `@include gl-software` に置き換えた（3D なしのときの値は同じ） |
+| `Userland/Application/Doom/Environment/linuxxdoom-x86_64.env` | `@include gl-software`。プログラムプロファイルは x11-client より先に読まれるので、先に読んだ値が勝つ |
+
+X サーバ（glamor on virgl）はそのまま GPU を使う。Doom の llvmpipe は DRISW 経由の
+`XPutImage` / MIT-SHM でウィンドウに出す。
+
+### 検証（arm64 / HVF。Doom を AUTOSTART したイメージ）
+
+| 構成 | 結果 |
+|---|---|
+| qemu-virgl + `virtio-gpu-gl-pci` + `cocoa,gl=es`、修正前 | GLSL 3.30 エラー、ウィンドウは全面白 |
+| 同、修正後 | `shader: 3` → `Finished initializing!`、ウィンドウにゲーム画面（バッキングストアのダンプで確認） |
+| `virtio-gpu-pci`（3D なし）、修正後 | 従来どおり描画（include 経由で同じ値になる） |
+
+メモ: virgl で GL を表示している間、QEMU モニタの `screendump` は `Error: no surface` を返す。
+画面確認にはゲスト側でピクセルを読む必要がある。
+
+### 別件（未対応）: デモループで `W_GetNumForName: HELP2 not found!` で終了する
+
+`Resource/doom.wad` は The Ultimate Doom の IWAD（md5 `c4fe9fd9...`）。linuxdoom は
+`doomu.wad` を retail、`doom.wad` を registered と判定する。registered 扱いのデモループは
+4 枚目で `HELP2` を表示しようとするが、Ultimate Doom の WAD には無い（`CREDIT` に置き換わっている）。
+そのため、タイトル画面で放置すると約 130 秒後に Doom が終了する。ファイル名を `doomu.wad` にすれば直る。
