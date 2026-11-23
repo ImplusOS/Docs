@@ -147,6 +147,7 @@ Userland/Application/
 │                 Applications/*.desktop, Apps/{apps.list, desktop.icons}}
 ├── com.ImplusOS.linuxapp/        generic X11 host for a foreign Linux program
 ├── com.ImplusOS.sysnotif/        notification daemon
+├── com.ImplusOS.taskmanager/     task manager (processes, CPU/memory/disk/GPU graphs)
 └── BusyBox/                      BusyBox port (Resource/busybox binary)
 ```
 
@@ -288,6 +289,24 @@ rather than an X server.
 
 - Spawned by init once the WM has registered.
 - Displays system notifications / toasts through the WM.
+
+### Task Manager (`com.ImplusOS.taskmanager`)
+
+- A Windows-style task manager drawn on one UI.h canvas: プロセス (apps fold
+  the processes they started under one row; CPU / memory / disk / GPU columns
+  with totals and heat shading), パフォーマンス (60-second graphs for CPU,
+  memory, every disk and the GPU), 起動の記録 (the kernel's boot phases) and
+  詳細 (one row per process with PID, threads, priority, ABI). Right-click or
+  Delete ends a task; priorities can be changed.
+- Every number is a kernel counter differenced between two samples:
+  `os_get_cpu_usage()`, `process_perf_info_t` (runtime, disk bytes, GPU 3D /
+  copy time; threads are added to their `owner_pid`), `os_get_disk_stats()`
+  (per-disk ops, bytes, latency, busy time -> "active time") and
+  `os_get_gpu_usage()` (per-engine busy time -> the GPU is as busy as its
+  busiest engine; presents; GPU buffer memory).
+- The disk list is fetched only once the Performance page is open, because
+  the first listing waits for the kernel's deferred transport probe; the
+  Processes page's disk total reads `SYSTEM_DISK_STATS_ALL`, which does not.
 
 ### BusyBox (`Userland/Application/BusyBox/`)
 

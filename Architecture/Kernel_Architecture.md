@@ -222,6 +222,7 @@ arm64 convention:
 | 250–254 | System | shutdown, reboot, shutdown broadcast, get total/used memory |
 | 260–261 | Debug | get_proc_debug_info, get_os_debug_info |
 | 262–267 | Wi-Fi / DHCP | wifi scan_start / get_scan_results / connect / disconnect / get_status, net_get_dhcp_dns |
+| 279–280 | Sys Info (usage) | get_disk_stats (per-disk I/O counters and busy time, `Platform/io/IO_Stats.c`), get_gpu_usage (per-engine busy time, presents, GPU buffer memory, `Core/sysinfo/GpuStats.c`) |
 
 Exact numbers and any additions live in `Kernel/Core/syscall/Syscall_Main.h`
 (the ranges above are not fully contiguous).
